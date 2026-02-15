@@ -7,12 +7,36 @@
 namespace rafty {
     using grpc::ServerBuilder;
     using grpc::ServerContext;
+    using grpc::Status;
     using grpc::experimental::ClientInterceptorFactoryInterface;
     using grpc::experimental::CreateCustomChannelWithInterceptors;
+
+    namespace {
+        class RaftRpcHandler final : public raftpb::RaftService::Service {
+        public:
+            explicit RaftRpcHandler(Raft *raft) : raft_(raft) {}
+
+            Status AppendEntries(ServerContext * /*context*/, const raftpb::AppendEntriesRequest * /*request*/,
+                                 raftpb::AppendEntriesReply * /*reply*/) override {
+                (void)this->raft_;
+                return Status::OK;
+            }
+
+            Status RequestVote(ServerContext * /*context*/, const raftpb::RequestVoteRequest * /*request*/,
+                               raftpb::RequestVoteReply * /*reply*/) override {
+                (void)this->raft_;
+                return Status::OK;
+            }
+
+        private:
+            Raft *raft_;
+        };
+    } // namespace
 
     Raft::Raft(const Config &config, MessageQueue<ApplyResult> &ready)
         : logger(utils::logger::get_logger(config.id)), id(config.id), listening_addr(config.addr),
           peer_addrs(config.peer_addrs), dead(false), ready_queue(ready) {
+        this->service_ = std::make_unique<RaftRpcHandler>(this);
         // TODO: add more field if desired
         // TODO: finish it
     }

@@ -25,9 +25,7 @@ namespace rafty {
         builder.experimental().SetInterceptorCreators(tracing::CreateServerTracingInterceptors());
 #endif
 
-        // TODO: implement RaftService RPC
-        // and register the service.
-        builder.RegisterService(nullptr); /* replace nullptr with actual gRPC service */
+        builder.RegisterService(this->service_.get());
 
         std::unique_ptr<Server> server(builder.BuildAndStart());
         logger->info("Raft server {} listening on {}", id, listening_addr);

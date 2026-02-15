@@ -70,6 +70,7 @@ namespace rafty {
         MessageQueue<ApplyResult> &ready_queue;
 
         std::unordered_map<uint64_t, RaftServiceStub> peers_;
+        std::unique_ptr<raftpb::RaftService::Service> service_;
         std::unique_ptr<Server> server_;
     };
 } // namespace rafty
