@@ -19,10 +19,9 @@ namespace rafty {
         public:
             explicit RaftRpcHandler(Raft *raft) : raft_(raft) {}
 
-            Status AppendEntries(ServerContext * /*context*/, const raftpb::AppendEntriesRequest * /*request*/,
-                                 raftpb::AppendEntriesReply * /*reply*/) override {
-                (void)this->raft_;
-                return Status::OK;
+            Status AppendEntries(ServerContext * /*context*/, const raftpb::AppendEntriesRequest *request,
+                                 raftpb::AppendEntriesReply *reply) override {
+                return this->raft_->handle_append_entries_rpc(request, reply);
             }
 
             Status RequestVote(ServerContext * /*context*/, const raftpb::RequestVoteRequest *request,
@@ -117,6 +116,29 @@ namespace rafty {
             this->become_leader_locked();
             this->election_needs_vote_requests_ = false;
         }
+    }
+
+    grpc::Status Raft::handle_append_entries_rpc(const raftpb::AppendEntriesRequest *request,
+                                                 raftpb::AppendEntriesReply *reply) {
+        std::lock_guard<std::mutex> lk(this->mtx);
+        const uint64_t req_term = request->term();
+
+        if(req_term < this->current_term_) {
+            reply->set_term(this->current_term_);
+            reply->set_success(false);
+            return grpc::Status::OK;
+        }
+
+        if(req_term > this->current_term_) {
+            this->become_follower_locked(req_term);
+        } else {
+            this->role_ = Role::Follower;
+            this->reset_election_deadline_locked();
+        }
+
+        reply->set_term(this->current_term_);
+        reply->set_success(true);
+        return grpc::Status::OK;
     }
 
     grpc::Status Raft::handle_request_vote_rpc(const raftpb::RequestVoteRequest *request, raftpb::RequestVoteReply *reply) {

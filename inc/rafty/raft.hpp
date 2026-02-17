@@ -48,6 +48,7 @@ namespace rafty {
         void connect_peers();
         bool is_dead() const;
         void kill();
+        grpc::Status handle_append_entries_rpc(const raftpb::AppendEntriesRequest *request, raftpb::AppendEntriesReply *reply);
         grpc::Status handle_request_vote_rpc(const raftpb::RequestVoteRequest *request, raftpb::RequestVoteReply *reply);
 
     private:
