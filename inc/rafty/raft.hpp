@@ -2,9 +2,13 @@
 
 #include <cstdint>
 #include <functional>
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 #include <grpcpp/grpcpp.h>
@@ -59,6 +63,12 @@ namespace rafty {
         std::unique_ptr<rafty::utils::logger> logger;
 
     private:
+        enum class Role {
+            Follower,
+            Candidate,
+            Leader,
+        };
+
         // WARN: do not modify the declaration of
         // `id`, `listening_addr`, `peer_addrs`,
         // `dead`, `ready_queue`, `peers_`, and `server_`.
@@ -72,6 +82,28 @@ namespace rafty {
         std::unordered_map<uint64_t, RaftServiceStub> peers_;
         std::unique_ptr<raftpb::RaftService::Service> service_;
         std::unique_ptr<Server> server_;
+
+        std::atomic<bool> started_{ false };
+        std::thread ticker_;
+
+        Role role_ = Role::Follower;
+        uint64_t current_term_ = 0;
+        std::optional<uint64_t> voted_for_ = std::nullopt;
+
+        std::chrono::milliseconds heartbeat_interval_{ 120 };
+        std::chrono::milliseconds election_timeout_min_{ 450 };
+        std::chrono::milliseconds election_timeout_max_{ 900 };
+
+        std::chrono::steady_clock::time_point next_heartbeat_at_{};
+        std::chrono::steady_clock::time_point election_deadline_{};
+
+        std::chrono::milliseconds random_election_timeout() const;
+        void reset_election_deadline_locked();
+        void start_election_locked();
+        void become_leader_locked();
+        void become_follower_locked(uint64_t new_term);
+        void send_heartbeats_once();
+        void ticker_loop();
     };
 } // namespace rafty
 
