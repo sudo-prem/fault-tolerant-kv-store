@@ -25,10 +25,9 @@ namespace rafty {
                 return Status::OK;
             }
 
-            Status RequestVote(ServerContext * /*context*/, const raftpb::RequestVoteRequest * /*request*/,
-                               raftpb::RequestVoteReply * /*reply*/) override {
-                (void)this->raft_;
-                return Status::OK;
+            Status RequestVote(ServerContext * /*context*/, const raftpb::RequestVoteRequest *request,
+                               raftpb::RequestVoteReply *reply) override {
+                return this->raft_->handle_request_vote_rpc(request, reply);
             }
 
         private:
@@ -63,7 +62,11 @@ namespace rafty {
     }
 
     State Raft::get_state() const {
-        // TODO: lab 1
+        std::lock_guard<std::mutex> lk(this->mtx);
+        return State{
+            .term = this->current_term_,
+            .is_leader = this->role_ == Role::Leader,
+        };
     }
 
     ProposalResult Raft::propose(const std::string &data) {
@@ -103,11 +106,93 @@ namespace rafty {
         this->role_ = Role::Candidate;
         this->current_term_ += 1;
         this->voted_for_ = this->id;
+        this->votes_granted_in_term_ = 1;
         this->reset_election_deadline_locked();
         logger->info("Node {} started election for term {}", this->id, this->current_term_);
 
-        // Part B only: bootstrap single-node cluster leadership.
-        if(this->peer_addrs.empty()) { this->become_leader_locked(); }
+        this->pending_vote_request_term_ = this->current_term_;
+        this->election_needs_vote_requests_ = true;
+
+        if(this->votes_granted_in_term_ > this->peer_addrs.size() / 2) {
+            this->become_leader_locked();
+            this->election_needs_vote_requests_ = false;
+        }
+    }
+
+    grpc::Status Raft::handle_request_vote_rpc(const raftpb::RequestVoteRequest *request, raftpb::RequestVoteReply *reply) {
+        std::lock_guard<std::mutex> lk(this->mtx);
+        const uint64_t req_term = request->term();
+
+        if(req_term < this->current_term_) {
+            reply->set_term(this->current_term_);
+            reply->set_vote_granted(false);
+            return grpc::Status::OK;
+        }
+
+        if(req_term > this->current_term_) {
+            this->become_follower_locked(req_term);
+        }
+
+        constexpr uint64_t local_last_log_term = 0;
+        constexpr uint64_t local_last_log_index = 0;
+        const bool candidate_up_to_date =
+            (request->last_log_term() > local_last_log_term) ||
+            (request->last_log_term() == local_last_log_term && request->last_log_index() >= local_last_log_index);
+
+        const bool can_vote_for_candidate = !this->voted_for_.has_value() || this->voted_for_.value() == request->candidate_id();
+        const bool grant_vote = can_vote_for_candidate && candidate_up_to_date;
+
+        if(grant_vote) {
+            this->voted_for_ = request->candidate_id();
+            this->reset_election_deadline_locked();
+        }
+
+        reply->set_term(this->current_term_);
+        reply->set_vote_granted(grant_vote);
+        return grpc::Status::OK;
+    }
+
+    void Raft::send_request_votes_once(uint64_t term) {
+        raftpb::RequestVoteRequest req;
+        req.set_term(term);
+        req.set_candidate_id(this->id);
+        req.set_last_log_index(0);
+        req.set_last_log_term(0);
+
+        for(const auto &[peer_id, _] : this->peer_addrs) {
+            auto stub_it = this->peers_.find(peer_id);
+            if(stub_it == this->peers_.end()) {
+                continue;
+            }
+
+            raftpb::RequestVoteReply reply;
+            auto context = this->create_context(peer_id);
+            context->set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(200));
+            grpc::Status status = stub_it->second->RequestVote(&*context, req, &reply);
+            if(!status.ok()) {
+                continue;
+            }
+
+            std::lock_guard<std::mutex> lk(this->mtx);
+            if(reply.term() > this->current_term_) {
+                this->become_follower_locked(reply.term());
+                this->election_needs_vote_requests_ = false;
+                continue;
+            }
+
+            // Ignore stale replies from prior terms or after role changes.
+            if(this->role_ != Role::Candidate || this->current_term_ != term) {
+                continue;
+            }
+
+            if(reply.vote_granted()) {
+                this->votes_granted_in_term_ += 1;
+                if(this->votes_granted_in_term_ > this->peer_addrs.size() / 2) {
+                    this->become_leader_locked();
+                    this->election_needs_vote_requests_ = false;
+                }
+            }
+        }
     }
 
     void Raft::send_heartbeats_once() {
@@ -147,6 +232,8 @@ namespace rafty {
     void Raft::ticker_loop() {
         while(!this->dead.load()) {
             bool should_send_heartbeat = false;
+            bool should_request_votes = false;
+            uint64_t vote_request_term = 0;
             {
                 std::lock_guard<std::mutex> lk(this->mtx);
                 const auto now = std::chrono::steady_clock::now();
@@ -159,9 +246,17 @@ namespace rafty {
                 } else if(now >= this->election_deadline_) {
                     this->start_election_locked();
                 }
+
+                if(this->election_needs_vote_requests_ && this->role_ == Role::Candidate &&
+                   this->pending_vote_request_term_ == this->current_term_) {
+                    should_request_votes = true;
+                    vote_request_term = this->current_term_;
+                    this->election_needs_vote_requests_ = false;
+                }
             }
 
             if(should_send_heartbeat) { this->send_heartbeats_once(); }
+            if(should_request_votes) { this->send_request_votes_once(vote_request_term); }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }

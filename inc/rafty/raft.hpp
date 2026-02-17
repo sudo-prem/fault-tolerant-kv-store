@@ -48,6 +48,7 @@ namespace rafty {
         void connect_peers();
         bool is_dead() const;
         void kill();
+        grpc::Status handle_request_vote_rpc(const raftpb::RequestVoteRequest *request, raftpb::RequestVoteReply *reply);
 
     private:
         // WARN: do not modify `create_context` and `apply`.
@@ -61,7 +62,6 @@ namespace rafty {
         // WARN: do not modify `mtx` and `logger`.
         mutable std::mutex mtx;
         std::unique_ptr<rafty::utils::logger> logger;
-
     private:
         enum class Role {
             Follower,
@@ -96,12 +96,16 @@ namespace rafty {
 
         std::chrono::steady_clock::time_point next_heartbeat_at_{};
         std::chrono::steady_clock::time_point election_deadline_{};
+        uint64_t votes_granted_in_term_ = 0;
+        bool election_needs_vote_requests_ = false;
+        uint64_t pending_vote_request_term_ = 0;
 
         std::chrono::milliseconds random_election_timeout() const;
         void reset_election_deadline_locked();
         void start_election_locked();
         void become_leader_locked();
         void become_follower_locked(uint64_t new_term);
+        void send_request_votes_once(uint64_t term);
         void send_heartbeats_once();
         void ticker_loop();
     };
