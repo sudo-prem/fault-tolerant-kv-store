@@ -84,6 +84,11 @@ namespace rafty {
         return std::chrono::milliseconds(min_ms + jitter);
     }
 
+    uint64_t Raft::quorum_size() const {
+        const uint64_t cluster_size = static_cast<uint64_t>(this->peer_addrs.size()) + 1;
+        return (cluster_size / 2) + 1;
+    }
+
     void Raft::reset_election_deadline_locked() {
         this->election_deadline_ = std::chrono::steady_clock::now() + this->random_election_timeout();
     }
@@ -112,7 +117,7 @@ namespace rafty {
         this->pending_vote_request_term_ = this->current_term_;
         this->election_needs_vote_requests_ = true;
 
-        if(this->votes_granted_in_term_ > this->peer_addrs.size() / 2) {
+        if(this->votes_granted_in_term_ >= this->quorum_size()) {
             this->become_leader_locked();
             this->election_needs_vote_requests_ = false;
         }
@@ -209,7 +214,7 @@ namespace rafty {
 
             if(reply.vote_granted()) {
                 this->votes_granted_in_term_ += 1;
-                if(this->votes_granted_in_term_ > this->peer_addrs.size() / 2) {
+                if(this->votes_granted_in_term_ >= this->quorum_size()) {
                     this->become_leader_locked();
                     this->election_needs_vote_requests_ = false;
                 }

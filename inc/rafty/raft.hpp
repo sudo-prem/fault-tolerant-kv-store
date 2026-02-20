@@ -102,6 +102,7 @@ namespace rafty {
         uint64_t pending_vote_request_term_ = 0;
 
         std::chrono::milliseconds random_election_timeout() const;
+        uint64_t quorum_size() const;
         void reset_election_deadline_locked();
         void start_election_locked();
         void become_leader_locked();
