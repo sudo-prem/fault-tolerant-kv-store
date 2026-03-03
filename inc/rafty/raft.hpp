@@ -10,6 +10,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include <grpcpp/grpcpp.h>
 
@@ -70,6 +71,12 @@ namespace rafty {
             Leader,
         };
 
+        struct LogEntry {
+            uint64_t index;
+            uint64_t term;
+            std::string data;
+        };
+
         // WARN: do not modify the declaration of
         // `id`, `listening_addr`, `peer_addrs`,
         // `dead`, `ready_queue`, `peers_`, and `server_`.
@@ -91,6 +98,15 @@ namespace rafty {
         uint64_t current_term_ = 0;
         std::optional<uint64_t> voted_for_ = std::nullopt;
 
+        // Log replication state (lab 2+). Indexes are 1-based; log_[0] is a dummy entry.
+        std::vector<LogEntry> log_;
+        uint64_t commit_index_ = 0;
+        uint64_t last_applied_ = 0;
+
+        // Leader state (reinitialized after election).
+        std::unordered_map<uint64_t, uint64_t> next_index_;
+        std::unordered_map<uint64_t, uint64_t> match_index_;
+
         std::chrono::milliseconds heartbeat_interval_{ 120 };
         std::chrono::milliseconds election_timeout_min_{ 450 };
         std::chrono::milliseconds election_timeout_max_{ 900 };
@@ -100,6 +116,10 @@ namespace rafty {
         uint64_t votes_granted_in_term_ = 0;
         bool election_needs_vote_requests_ = false;
         uint64_t pending_vote_request_term_ = 0;
+
+        uint64_t last_log_index_locked() const;
+        uint64_t last_log_term_locked() const;
+        raftpb::Entry to_proto_entry(const LogEntry &e) const;
 
         std::chrono::milliseconds random_election_timeout() const;
         uint64_t quorum_size() const;
