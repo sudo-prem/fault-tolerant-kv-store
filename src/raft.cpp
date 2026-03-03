@@ -176,8 +176,51 @@ namespace rafty {
         if(req_term > this->current_term_) {
             this->become_follower_locked(req_term);
         } else {
-            this->role_ = Role::Follower;
-            this->reset_election_deadline_locked();
+            if(this->role_ != Role::Follower) {
+                this->role_ = Role::Follower;
+            }
+        }
+
+        // Valid leader contact for current term; prevent election.
+        this->reset_election_deadline_locked();
+
+        const uint64_t prev_index = request->prev_log_index();
+        const uint64_t prev_term = request->prev_log_term();
+
+        // Reply false if log doesn't contain an entry at prev_log_index whose term matches prev_log_term.
+        if(prev_index >= this->log_.size()) {
+            reply->set_term(this->current_term_);
+            reply->set_success(false);
+            return grpc::Status::OK;
+        }
+        if(this->log_[prev_index].term != prev_term) {
+            reply->set_term(this->current_term_);
+            reply->set_success(false);
+            return grpc::Status::OK;
+        }
+
+        // If an existing entry conflicts with a new one (same index but different term),
+        // delete the existing entry and all that follow it, then append new entries.
+        uint64_t idx = prev_index;
+        for(const auto &incoming : request->entries()) {
+            idx += 1;
+            const uint64_t in_term = incoming.term();
+            const std::string in_data = incoming.command();
+
+            if(idx < this->log_.size()) {
+                if(this->log_[idx].term != in_term) {
+                    this->log_.resize(idx);
+                }
+            }
+
+            if(idx == this->log_.size()) {
+                this->log_.push_back(LogEntry{.index = idx, .term = in_term, .data = in_data});
+            }
+        }
+
+        // Advance commit index (apply happens in part C).
+        if(request->leader_commit() > this->commit_index_) {
+            this->commit_index_ = std::min<uint64_t>(request->leader_commit(), this->last_log_index_locked());
         }
 
         reply->set_term(this->current_term_);
@@ -344,6 +387,15 @@ namespace rafty {
                 if(reply.term() > this->current_term_) {
                     logger->info("Node {} stepping down due to higher term {}", this->id, reply.term());
                     this->become_follower_locked(reply.term());
+                }
+                continue;
+            }
+
+            if(!reply.success()) {
+                std::lock_guard<std::mutex> lk(this->mtx);
+                if(this->role_ == Role::Leader && this->current_term_ == plan.term) {
+                    // Back up nextIndex and retry later.
+                    this->next_index_[peer_id] = std::max<uint64_t>(1, plan.prev_log_index);
                 }
                 continue;
             }
