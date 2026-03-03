@@ -120,6 +120,8 @@ namespace rafty {
         uint64_t last_log_index_locked() const;
         uint64_t last_log_term_locked() const;
         raftpb::Entry to_proto_entry(const LogEntry &e) const;
+        uint64_t majority_match_index_locked() const;
+        std::vector<ApplyResult> collect_newly_committed_applies_locked();
 
         std::chrono::milliseconds random_election_timeout() const;
         uint64_t quorum_size() const;
