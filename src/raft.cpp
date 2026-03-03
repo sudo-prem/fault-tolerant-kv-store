@@ -93,13 +93,13 @@ namespace rafty {
         const uint64_t term = this->current_term_;
         this->log_.push_back(LogEntry{.index = index, .term = term, .data = data});
 
-        // Kick replication soon (do not wait for commit).
+        // Kick replication soon, do not wait for commit
         this->next_heartbeat_at_ = std::chrono::steady_clock::now();
 
         result.index = index;
         result.term = term;
 
-        // Single-node optimization: commit immediately.
+        // Single node optimization: commit immediately
         if(this->quorum_size() == 1 && this->commit_index_ < index && index < this->log_.size() && this->log_[index].term == this->current_term_) {
             this->commit_index_ = index;
             auto applies = this->collect_newly_committed_applies_locked();
@@ -247,13 +247,13 @@ namespace rafty {
             }
         }
 
-        // Valid leader contact for current term; prevent election.
+        // Valid leader contact for current term; prevent election
         this->reset_election_deadline_locked();
 
         const uint64_t prev_index = request->prev_log_index();
         const uint64_t prev_term = request->prev_log_term();
 
-        // Reply false if log doesn't contain an entry at prev_log_index whose term matches prev_log_term.
+        // Reply false if log doesn't contain an entry at prev_log_index whose term matches prev_log_term
         if(prev_index >= this->log_.size()) {
             reply->set_term(this->current_term_);
             reply->set_success(false);
@@ -265,8 +265,8 @@ namespace rafty {
             return grpc::Status::OK;
         }
 
-        // If an existing entry conflicts with a new one (same index but different term),
-        // delete the existing entry and all that follow it, then append new entries.
+        // If an existing entry conflicts with a new onem same index but different term
+        // delete the existing entry and all that follow it, then append new entries
         uint64_t idx = prev_index;
         for(const auto &incoming : request->entries()) {
             idx += 1;
@@ -284,7 +284,7 @@ namespace rafty {
             }
         }
 
-        // Advance commit index (apply happens in part C).
+        // Advance commit index
         if(request->leader_commit() > this->commit_index_) {
             this->commit_index_ = std::min<uint64_t>(request->leader_commit(), this->last_log_index_locked());
         }
@@ -364,7 +364,7 @@ namespace rafty {
                 continue;
             }
 
-            // Ignore stale replies from prior terms or after role changes.
+            // Ignore stale replies from prior terms or after role changes
             if(this->role_ != Role::Candidate || this->current_term_ != term) {
                 continue;
             }
@@ -408,7 +408,7 @@ namespace rafty {
                 auto it = this->next_index_.find(peer_id);
                 uint64_t next_index = (it == this->next_index_.end()) ? (last_index + 1) : it->second;
 
-                // Clamp next_index to a valid range.
+                // Clamp next_index to a valid range
                 if(next_index < 1) {
                     next_index = 1;
                 }
@@ -479,7 +479,7 @@ namespace rafty {
                     continue;
                 }
 
-                // Update follower progress (works for both empty and non-empty appends).
+                // Update follower progress - works for both empty and non-empty appends
                 const uint64_t advanced = plan.prev_log_index + static_cast<uint64_t>(plan.entries.size());
                 auto cur_match = this->match_index_.find(peer_id);
                 uint64_t prev_match = (cur_match == this->match_index_.end()) ? 0 : cur_match->second;
@@ -487,11 +487,11 @@ namespace rafty {
                 this->match_index_[peer_id] = new_match;
                 this->next_index_[peer_id] = new_match + 1;
 
-                // Leader commit rule: commit N if a majority have replicated it and log[N].term == currentTerm.
+                // Leader commit rule: commit N if a majority have replicated it and log[N].term == currentTerm
                 const uint64_t candidate = this->majority_match_index_locked();
                 if(candidate > this->commit_index_ && candidate < this->log_.size() && this->log_[candidate].term == this->current_term_) {
                     this->commit_index_ = candidate;
-                    // Propagate updated leaderCommit promptly.
+                    // Propagate updated leaderCommit promptly
                     this->next_heartbeat_at_ = std::chrono::steady_clock::now();
                 }
 

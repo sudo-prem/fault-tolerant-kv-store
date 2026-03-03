@@ -98,12 +98,13 @@ namespace rafty {
         uint64_t current_term_ = 0;
         std::optional<uint64_t> voted_for_ = std::nullopt;
 
-        // Log replication state (lab 2+). Indexes are 1-based; log_[0] is a dummy entry.
+        // Log replication state
+        // Indexes are 1-based; log_[0] is a dummy entry
         std::vector<LogEntry> log_;
         uint64_t commit_index_ = 0;
         uint64_t last_applied_ = 0;
 
-        // Leader state (reinitialized after election).
+        // Leader state (reinitialized after election)
         std::unordered_map<uint64_t, uint64_t> next_index_;
         std::unordered_map<uint64_t, uint64_t> match_index_;
 
