@@ -389,7 +389,7 @@ namespace rafty {
             std::vector<LogEntry> entries;
         };
 
-        constexpr size_t kMaxEntriesPerAppend = 1; // keep RPC size bounded
+        constexpr size_t kMaxEntriesPerAppend = 16; // faster catch-up while keeping RPC size bounded
 
         for(const auto &[peer_id, _] : this->peer_addrs) {
             auto stub_it = this->peers_.find(peer_id);
@@ -466,8 +466,10 @@ namespace rafty {
             if(!reply.success()) {
                 std::lock_guard<std::mutex> lk(this->mtx);
                 if(this->role_ == Role::Leader && this->current_term_ == plan.term) {
-                    // Back up nextIndex and retry later.
-                    this->next_index_[peer_id] = std::max<uint64_t>(1, plan.prev_log_index);
+                    // Back up nextIndex aggressively to reduce retry rounds on diverged logs.
+                    const uint64_t cur = this->next_index_.contains(peer_id) ? this->next_index_[peer_id] : (plan.prev_log_index + 1);
+                    const uint64_t step = std::max<uint64_t>(1, (cur - 1) / 2);
+                    this->next_index_[peer_id] = std::max<uint64_t>(1, cur - step);
                 }
                 continue;
             }
