@@ -18,8 +18,8 @@ foreach(app_source ${APP_SOURCES})
 
     # Link the test executable with the librafty and the generated protobuf library
     if (TRACING)
-        target_link_libraries(${app_name} PRIVATE 
-            rafty raft_grpc_proto tester_grpc_proto
+        target_link_libraries(${app_name} PRIVATE
+            rafty raft_grpc_proto tester_grpc_proto kv_grpc_proto
             spdlog::spdlog $<$<BOOL:${MINGW}>:ws2_32>
             absl::check
             absl::flags
@@ -37,8 +37,8 @@ foreach(app_source ${APP_SOURCES})
             opentelemetry_contrib::spdlog_sink
         )
     else()
-        target_link_libraries(${app_name} PRIVATE 
-            rafty raft_grpc_proto tester_grpc_proto
+        target_link_libraries(${app_name} PRIVATE
+            rafty raft_grpc_proto tester_grpc_proto kv_grpc_proto
             spdlog::spdlog $<$<BOOL:${MINGW}>:ws2_32>
             absl::check
             absl::flags

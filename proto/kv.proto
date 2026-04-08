@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package kvpb;
+
+service KvService {
+  rpc Put(PutRequest) returns (KvResponse) {}
+  rpc Get(GetRequest) returns (GetResponse) {}
+  rpc Append(AppendRequest) returns (KvResponse) {}
+}
+
+enum KvStatus {
+  KV_SUCCESS = 0;
+  KV_NOTLEADER = 1;
+  KV_TIMEOUT = 2;
+}
+
+message PutRequest {
+  string key = 1;
+  string value = 2;
+  uint64 client_id = 3;  // RIFL: unique client identifier
+  uint64 seq_num = 4;    // RIFL: monotonically increasing per-client sequence number
+}
+
+message GetRequest {
+  string key = 1;
+  uint64 client_id = 2;
+  uint64 seq_num = 3;
+}
+
+message AppendRequest {
+  string key = 1;
+  string value = 2;
+  uint64 client_id = 3;
+  uint64 seq_num = 4;
+}
+
+message KvResponse {
+  KvStatus status = 1;
+}
+
+message GetResponse {
+  KvStatus status = 1;
+  string value = 2;
+}

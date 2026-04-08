@@ -9,8 +9,8 @@ foreach(test_source ${TEST_SOURCES})
     add_executable(${test_name} ${test_source} ${absl_INCLUDE_DIRS} ${Protobuf_INCLUDE_DIRS} )
 
     if (TRACING)
-        target_link_libraries(${test_name} PRIVATE 
-            rafty raft_grpc_proto tester_grpc_proto
+        target_link_libraries(${test_name} PRIVATE
+            rafty raft_grpc_proto tester_grpc_proto kv_grpc_proto
             gtest gtest_main
             absl::flags
             absl::flags_parse
@@ -22,8 +22,8 @@ foreach(test_source ${TEST_SOURCES})
             opentelemetry_contrib::spdlog_sink
         )
     else()
-        target_link_libraries(${test_name} PRIVATE 
-            rafty raft_grpc_proto tester_grpc_proto
+        target_link_libraries(${test_name} PRIVATE
+            rafty raft_grpc_proto tester_grpc_proto kv_grpc_proto
             gtest gtest_main
             absl::flags
             absl::flags_parse

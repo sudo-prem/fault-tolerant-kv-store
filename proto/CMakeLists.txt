@@ -1,6 +1,7 @@
 # Proto file
 get_filename_component(raft_proto "./raft.proto" ABSOLUTE)
 get_filename_component(tester_proto "./tester.proto" ABSOLUTE)
+get_filename_component(kv_proto "./kv.proto" ABSOLUTE)
 get_filename_component(raft_proto_path "${raft_proto}" PATH)
 
 set(raft_proto_srcs "${CMAKE_CURRENT_BINARY_DIR}/raft.pb.cc")
@@ -13,15 +14,20 @@ set(tester_proto_hdrs "${CMAKE_CURRENT_BINARY_DIR}/tester.pb.h")
 set(tester_grpc_srcs "${CMAKE_CURRENT_BINARY_DIR}/tester.grpc.pb.cc")
 set(tester_grpc_hdrs "${CMAKE_CURRENT_BINARY_DIR}/tester.grpc.pb.h")
 
+set(kv_proto_srcs "${CMAKE_CURRENT_BINARY_DIR}/kv.pb.cc")
+set(kv_proto_hdrs "${CMAKE_CURRENT_BINARY_DIR}/kv.pb.h")
+set(kv_grpc_srcs "${CMAKE_CURRENT_BINARY_DIR}/kv.grpc.pb.cc")
+set(kv_grpc_hdrs "${CMAKE_CURRENT_BINARY_DIR}/kv.grpc.pb.h")
+
 add_custom_command(
-      OUTPUT "${raft_proto_srcs}" "${raft_proto_hdrs}" "${raft_grpc_srcs}" "${raft_grpc_hdrs}" "${tester_proto_srcs}" "${tester_proto_hdrs}" "${tester_grpc_srcs}" "${tester_grpc_hdrs}"
+      OUTPUT "${raft_proto_srcs}" "${raft_proto_hdrs}" "${raft_grpc_srcs}" "${raft_grpc_hdrs}" "${tester_proto_srcs}" "${tester_proto_hdrs}" "${tester_grpc_srcs}" "${tester_grpc_hdrs}" "${kv_proto_srcs}" "${kv_proto_hdrs}" "${kv_grpc_srcs}" "${kv_grpc_hdrs}"
       COMMAND ${_PROTOBUF_PROTOC}
       ARGS --grpc_out "${CMAKE_CURRENT_BINARY_DIR}"
         --cpp_out "${CMAKE_CURRENT_BINARY_DIR}"
         -I "${raft_proto_path}"
         --plugin=protoc-gen-grpc="${_GRPC_CPP_PLUGIN_EXECUTABLE}"
-        "${raft_proto}" "${tester_proto}"
-      DEPENDS "${raft_proto}" "${tester_proto}")
+        "${raft_proto}" "${tester_proto}" "${kv_proto}"
+      DEPENDS "${raft_proto}" "${tester_proto}" "${kv_proto}")
 
 # Include generated *.pb.h files
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")
@@ -53,7 +59,21 @@ target_link_libraries(tester_grpc_proto
   ${_PROTOBUF_LIBPROTOBUF}
 )
 
-add_custom_target(generate_proto_files ALL DEPENDS 
+add_library(kv_grpc_proto STATIC
+  ${kv_grpc_srcs}
+  ${kv_grpc_hdrs}
+  ${kv_proto_srcs}
+  ${kv_proto_hdrs}
+)
+
+target_link_libraries(kv_grpc_proto
+  absl::check
+  ${_REFLECTION}
+  ${_GRPC_GRPCPP}
+  ${_PROTOBUF_LIBPROTOBUF}
+)
+
+add_custom_target(generate_proto_files ALL DEPENDS
   ${raft_proto_srcs}
   ${raft_proto_hdrs}
   ${raft_grpc_srcs}
@@ -62,6 +82,10 @@ add_custom_target(generate_proto_files ALL DEPENDS
   ${tester_proto_hdrs}
   ${tester_grpc_srcs}
   ${tester_grpc_hdrs}
+  ${kv_proto_srcs}
+  ${kv_proto_hdrs}
+  ${kv_grpc_srcs}
+  ${kv_grpc_hdrs}
 )
 
 # Create the generated directory if it doesn't exist
