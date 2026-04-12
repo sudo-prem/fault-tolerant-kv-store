@@ -1,0 +1,1141 @@
+From bb4b771f1bb84f3f90a999092d54469dfa442f1a Mon Sep 17 00:00:00 2001
+From: Seo Jin Park <seojinpa@usc.edu>
+Date: Tue, 7 Apr 2026 19:19:04 -0700
+Subject: [PATCH] Add Lab 3 KV store skeleton and test infrastructure
+
+---
+ app/CMakeLists.txt               |   8 +-
+ app/kv_node.cpp                  | 301 ++++++++++++++++++++++++++
+ bench/.gitkeep                   |   0
+ inc/kv/kv_client.hpp             | 147 +++++++++++++
+ inc/kv/kv_server.hpp             | 108 ++++++++++
+ integration_tests/CMakeLists.txt |   8 +-
+ integration_tests/kv_test.cpp    | 360 +++++++++++++++++++++++++++++++
+ proto/CMakeLists.txt             |  32 ++-
+ proto/kv.proto                   |  44 ++++
+ 9 files changed, 996 insertions(+), 12 deletions(-)
+ create mode 100644 app/kv_node.cpp
+ create mode 100644 bench/.gitkeep
+ create mode 100644 inc/kv/kv_client.hpp
+ create mode 100644 inc/kv/kv_server.hpp
+ create mode 100644 integration_tests/kv_test.cpp
+ create mode 100644 proto/kv.proto
+
+diff --git a/app/CMakeLists.txt b/app/CMakeLists.txt
+index 753d981..1874e6a 100644
+--- a/app/CMakeLists.txt
++++ b/app/CMakeLists.txt
+@@ -18,8 +18,8 @@ foreach(app_source ${APP_SOURCES})
+ 
+     # Link the test executable with the librafty and the generated protobuf library
+     if (TRACING)
+-        target_link_libraries(${app_name} PRIVATE 
+-            rafty raft_grpc_proto tester_grpc_proto
++        target_link_libraries(${app_name} PRIVATE
++            rafty raft_grpc_proto tester_grpc_proto kv_grpc_proto
+             spdlog::spdlog $<$<BOOL:${MINGW}>:ws2_32>
+             absl::check
+             absl::flags
+@@ -37,8 +37,8 @@ foreach(app_source ${APP_SOURCES})
+             opentelemetry_contrib::spdlog_sink
+         )
+     else()
+-        target_link_libraries(${app_name} PRIVATE 
+-            rafty raft_grpc_proto tester_grpc_proto
++        target_link_libraries(${app_name} PRIVATE
++            rafty raft_grpc_proto tester_grpc_proto kv_grpc_proto
+             spdlog::spdlog $<$<BOOL:${MINGW}>:ws2_32>
+             absl::check
+             absl::flags
+diff --git a/app/kv_node.cpp b/app/kv_node.cpp
+new file mode 100644
+index 0000000..7023acc
+--- /dev/null
++++ b/app/kv_node.cpp
+@@ -0,0 +1,301 @@
++#include <atomic>
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <thread>
++#include <vector>
++#include <csignal>
++#include <poll.h>
++#include <unistd.h>
++
++#include <ddb/integration.hpp>
++
++#include "absl/flags/flag.h"
++#include "absl/flags/parse.h"
++#include "absl/strings/str_join.h"
++#include "absl/strings/str_split.h"
++
++#include "common/config.hpp"
++#include "common/logger.hpp"
++#include "common/utils/net_intercepter.hpp"
++#ifdef TRACING
++#include "common/utils/tracing.hpp"
++#endif
++#include "toolings/msg_queue.hpp"
++#include "toolings/raft_wrapper.hpp"
++
++#include "kv/kv_server.hpp"
++
++// KV port = Raft port + KV_PORT_OFFSET
++static constexpr uint64_t KV_PORT_OFFSET = 1000;
++
++// ---------------------------------------------------------------------------
++// KvNodeWrapper extends RaftWrapper to add a KV gRPC service.
++//
++// Architecture:
++//   - Raft gRPC server on port P       (inter-node consensus RPCs)
++//   - Tester gRPC server on tester port (test infrastructure control)
++//   - KV gRPC server on port P+1000    (client-facing Put/Get/Append)
++//
++// When Raft commits a log entry, the Apply handler (overridden here)
++// forwards it to KvServer::on_apply() AND streams it to the tester.
++// ---------------------------------------------------------------------------
++class KvNodeWrapper : public toolings::RaftWrapper {
++public:
++  KvNodeWrapper(const std::string &ctrl_addr, uint64_t t_node_port,
++                uint64_t kv_port, const rafty::Config &config,
++                toolings::MessageQueue<rafty::ApplyResult> &ready)
++      : toolings::RaftWrapper(ctrl_addr, t_node_port, config, ready),
++        kv_ready_(ready), node_id_(config.id) {
++    kv_server_ = std::make_unique<kv::KvServer>(
++        static_cast<rafty::Raft &>(*this));
++    start_kv_server(kv_port);
++  }
++
++  KvNodeWrapper(uint64_t kv_port, const rafty::Config &config,
++                toolings::MessageQueue<rafty::ApplyResult> &ready)
++      : toolings::RaftWrapper(config, ready), kv_ready_(ready),
++        node_id_(config.id) {
++    kv_server_ = std::make_unique<kv::KvServer>(
++        static_cast<rafty::Raft &>(*this));
++    start_kv_server(kv_port);
++  }
++
++  ~KvNodeWrapper() {
++    if (kv_grpc_server_) {
++      kv_grpc_server_->Shutdown();
++    }
++  }
++
++  // Override Apply to intercept committed Raft entries.
++  // Each committed entry is forwarded to KvServer::on_apply() (for KV state)
++  // and also streamed to the tester (for test infrastructure visibility).
++  grpc::Status
++  Apply(grpc::ServerContext *context, const google::protobuf::Empty *request,
++        grpc::ServerWriter<testerpb::ApplyResult> *writer) override {
++    (void)context;
++    (void)request;
++
++    while (!this->is_dead()) {
++      auto result = kv_ready_.dequeue();
++      if (this->is_dead())
++        break;
++      if (result.valid) {
++        // Forward to KvServer for KV state application
++        kv_server_->on_apply(result);
++
++        // Also stream to tester for test infrastructure
++        testerpb::ApplyResult r;
++        r.set_valid(result.valid);
++        r.set_data(result.data);
++        r.set_index(result.index);
++        r.set_id(node_id_);
++        writer->Write(r);
++      }
++    }
++    return grpc::Status::OK;
++  }
++
++private:
++  void start_kv_server(uint64_t port) {
++    grpc::EnableDefaultHealthCheckService(false);
++
++    grpc::ServerBuilder builder;
++    std::string addr = "0.0.0.0:" + std::to_string(port);
++    builder.AddListeningPort(addr, grpc::InsecureServerCredentials());
++    builder.RegisterService(kv_server_.get());
++    kv_grpc_server_ = builder.BuildAndStart();
++    std::cout << "KV server listening on " << addr << std::endl;
++    std::thread([this] { kv_grpc_server_->Wait(); }).detach();
++  }
++
++  toolings::MessageQueue<rafty::ApplyResult> &kv_ready_;
++  uint64_t node_id_;
++  std::unique_ptr<kv::KvServer> kv_server_;
++  std::unique_ptr<grpc::Server> kv_grpc_server_;
++};
++
++// ---------------------------------------------------------------------------
++// Command-line flags (same as raft_node, reused)
++// ---------------------------------------------------------------------------
++
++struct PeerAddrs {
++  std::map<uint64_t, std::string> values;
++};
++
++bool AbslParseFlag(absl::string_view text, PeerAddrs *out, std::string *error) {
++  if (text.empty()) {
++    return true;
++  }
++  std::vector<std::string> parts = absl::StrSplit(text, ',');
++  for (const auto &part : parts) {
++    std::vector<std::string> id_addr = absl::StrSplit(part, '+');
++    if (id_addr.size() != 2) {
++      *error = "Invalid peer address: " + part;
++      return false;
++    }
++    uint64_t id;
++    if (!absl::SimpleAtoi(id_addr[0], &id)) {
++      *error = "Invalid peer id: " + id_addr[0];
++      return false;
++    }
++    out->values[id] = id_addr[1];
++  }
++  return true;
++}
++
++std::string AbslUnparseFlag(const PeerAddrs &flag) {
++  std::vector<std::string> parts;
++  for (const auto &[id, addr] : flag.values) {
++    parts.emplace_back(std::to_string(id) + "+" + addr);
++  }
++  if (parts.empty()) {
++    return "";
++  }
++  return absl::StrJoin(parts, ",");
++}
++
++ABSL_FLAG(uint16_t, id, 0, "id for the current node");
++ABSL_FLAG(uint16_t, port, 50051, "Raft server port");
++ABSL_FLAG(PeerAddrs, peers, PeerAddrs(), "a list of peer addresses");
++ABSL_FLAG(int, verbosity, 1, "Verbosity level: 0 (silent), 1 (file only), 2 (all)");
++ABSL_FLAG(int, fail_type, 0, "Failure Type: 0 (disconnection), 1 (partition)");
++
++// tester flags
++ABSL_FLAG(bool, enable_ctrl, false, "Enable test controller");
++ABSL_FLAG(std::string, ctrl_addr, "localhost:55000", "Test controller address");
++ABSL_FLAG(uint64_t, node_tester_port, 55001, "Tester node port");
++
++// DDB flags
++ABSL_FLAG(bool, ddb, false, "Enable DDB");
++ABSL_FLAG(std::string, ddb_host_ip, "127.0.0.1", "DDB host IP");
++ABSL_FLAG(bool, wait_for_attach, true, "Wait for DDB attach");
++
++static std::unique_ptr<KvNodeWrapper> node = nullptr;
++std::atomic<bool> keep_running(true);
++
++void handle_sigint(int sig) {
++  (void)sig;
++  std::cout << "\nCaught SIGINT, cleaning up..." << std::endl;
++  if (node) {
++    node->kill();
++    node->stop_server();
++    node.reset();
++  }
++  keep_running.store(false, std::memory_order_seq_cst);
++}
++
++int setup_signal() {
++  struct sigaction sa;
++  sa.sa_handler = handle_sigint;
++  sigemptyset(&sa.sa_mask);
++  sa.sa_flags = 0;
++  if (sigaction(SIGINT, &sa, NULL) == -1) {
++    perror("sigaction");
++    return 1;
++  }
++  return 0;
++}
++
++void prepare_logging(uint64_t id) {
++  int verbosity = absl::GetFlag(FLAGS_verbosity);
++  auto logger_name = std::format("rafty_node_{}", static_cast<uint64_t>(id));
++  if (verbosity < 1) {
++    rafty::utils::disable_console_logging(spdlog::get(logger_name), true);
++  } else if (verbosity < 2) {
++    rafty::utils::disable_console_logging(spdlog::get(logger_name), false);
++  }
++}
++
++void prepare_interceptor(const std::set<std::string> &world) {
++  rafty::NetInterceptor::setup_rank(world);
++  int failure = absl::GetFlag(FLAGS_fail_type);
++  if (failure == 0) {
++    rafty::NetInterceptor::set_type(
++        rafty::NetInterceptionType::NETWORK_FAILURE);
++  } else if (failure == 1) {
++    rafty::NetInterceptor::set_type(
++        rafty::NetInterceptionType::NETWORK_PARTITION);
++  } else {
++    rafty::NetInterceptor::set_type(
++        rafty::NetInterceptionType::NETWORK_FAILURE);
++  }
++}
++
++int main(int argc, char **argv) {
++  absl::ParseCommandLine(argc, argv);
++
++  auto id = absl::GetFlag(FLAGS_id);
++  std::string node_alias = "kv_node_" + std::to_string(id);
++  auto port = absl::GetFlag(FLAGS_port);
++  uint64_t kv_port = port + KV_PORT_OFFSET;
++
++  // optionally enable DDB
++  if (absl::GetFlag(FLAGS_ddb)) {
++    auto cfg = DDB::Config::get_default(absl::GetFlag(FLAGS_ddb_host_ip))
++                   .with_alias(node_alias)
++                   .with_logical_group(node_alias);
++    cfg.wait_for_attach = absl::GetFlag(FLAGS_wait_for_attach);
++    auto connector = DDB::DDBConnector(cfg);
++    connector.init();
++  }
++
++  if (setup_signal() != 0) {
++    return 1;
++  }
++
++  rafty::utils::init_logger();
++
++#ifdef TRACING
++  tracing::InitOtelInfra(node_alias);
++#endif
++
++  std::map<uint64_t, std::string> peers;
++  if (!absl::GetFlag(FLAGS_peers).values.empty()) {
++    peers = absl::GetFlag(FLAGS_peers).values;
++  }
++
++  auto addr = "0.0.0.0:" + std::to_string(port);
++  rafty::Config config = {.id = id, .addr = addr, .peer_addrs = peers};
++
++  std::set<std::string> world;
++  world.insert(std::to_string(id));
++
++  std::cout << "KV node (id=" << id << ") Raft on " << addr
++            << ", KV on port " << kv_port << ", peers:" << std::endl;
++  for (const auto &[peer_id, peer_addr] : peers) {
++    std::cout << "\t" << peer_id << " " << peer_addr << std::endl;
++    world.insert(std::to_string(peer_id));
++  }
++
++  auto enable_tester = absl::GetFlag(FLAGS_enable_ctrl);
++  toolings::MessageQueue<rafty::ApplyResult> ready;
++
++  node = [&]() {
++    if (enable_tester) {
++      auto ctrl_addr = absl::GetFlag(FLAGS_ctrl_addr);
++      auto node_tester_port = absl::GetFlag(FLAGS_node_tester_port);
++      return std::make_unique<KvNodeWrapper>(ctrl_addr, node_tester_port,
++                                             kv_port, config, ready);
++    }
++    return std::make_unique<KvNodeWrapper>(kv_port, config, ready);
++  }();
++
++  prepare_interceptor(world);
++  prepare_logging(id);
++
++  node->start_server();
++
++  if (enable_tester) {
++    node->start_svr_loop();
++  } else {
++    // Interactive mode — block until SIGINT
++    std::cout << "KV node running. Press Ctrl+C to stop." << std::endl;
++    while (keep_running.load(std::memory_order_relaxed)) {
++      std::this_thread::sleep_for(std::chrono::milliseconds(100));
++    }
++  }
++
++  node.reset();
++  return 0;
++}
+diff --git a/bench/.gitkeep b/bench/.gitkeep
+new file mode 100644
+index 0000000..e69de29
+diff --git a/inc/kv/kv_client.hpp b/inc/kv/kv_client.hpp
+new file mode 100644
+index 0000000..307bd5f
+--- /dev/null
++++ b/inc/kv/kv_client.hpp
+@@ -0,0 +1,147 @@
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <memory>
++#include <random>
++#include <string>
++#include <thread>
++#include <utility>
++#include <vector>
++
++#include <grpcpp/grpcpp.h>
++
++#include "kv.grpc.pb.h"
++
++namespace kv {
++
++// ---------------------------------------------------------------------------
++// KvClient is a fault-tolerant client for the KV service.
++//
++// It maintains stubs to all replicas and automatically retries operations
++// when it encounters KV_NOTLEADER (rotating to the next replica) or
++// transient gRPC failures.
++//
++// Each KvClient instance has a unique random client_id and a monotonically
++// increasing seq_num, implementing the client side of RIFL.
++//
++// Usage:
++//   std::vector<std::string> addrs = {"localhost:51050", "localhost:51051", "localhost:51052"};
++//   kv::KvClient client(addrs);
++//   client.put("key", "value");
++//   auto [status, val] = client.get("key");
++//   client.append("key", " more");
++// ---------------------------------------------------------------------------
++class KvClient {
++public:
++  explicit KvClient(const std::vector<std::string> &addrs) : leader_idx_(0) {
++    std::random_device rd;
++    std::mt19937_64 gen(rd());
++    client_id_ = gen();
++    seq_num_ = 0;
++
++    grpc::ChannelArguments args;
++    args.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, 500);
++    args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, 100);
++    args.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, 100);
++
++    for (const auto &addr : addrs) {
++      auto channel = grpc::CreateCustomChannel(
++          addr, grpc::InsecureChannelCredentials(), args);
++      stubs_.push_back(kvpb::KvService::NewStub(std::move(channel)));
++    }
++  }
++
++  kvpb::KvStatus put(const std::string &key, const std::string &value) {
++    uint64_t seq = ++seq_num_;
++    for (int attempt = 0; attempt < max_attempts_; ++attempt) {
++      kvpb::PutRequest request;
++      request.set_key(key);
++      request.set_value(value);
++      request.set_client_id(client_id_);
++      request.set_seq_num(seq);
++
++      kvpb::KvResponse response;
++      grpc::ClientContext context;
++      context.set_deadline(std::chrono::system_clock::now() +
++                           rpc_timeout_);
++
++      auto status = stubs_[leader_idx_]->Put(&context, request, &response);
++      if (status.ok() && response.status() == kvpb::KV_SUCCESS) {
++        return kvpb::KV_SUCCESS;
++      }
++      // KV_NOTLEADER, KV_TIMEOUT, or gRPC failure — rotate to next node
++      rotate_leader();
++      std::this_thread::sleep_for(std::chrono::milliseconds(100));
++    }
++    return kvpb::KV_TIMEOUT;
++  }
++
++  std::pair<kvpb::KvStatus, std::string> get(const std::string &key) {
++    uint64_t seq = ++seq_num_;
++    for (int attempt = 0; attempt < max_attempts_; ++attempt) {
++      kvpb::GetRequest request;
++      request.set_key(key);
++      request.set_client_id(client_id_);
++      request.set_seq_num(seq);
++
++      kvpb::GetResponse response;
++      grpc::ClientContext context;
++      context.set_deadline(std::chrono::system_clock::now() +
++                           rpc_timeout_);
++
++      auto status = stubs_[leader_idx_]->Get(&context, request, &response);
++      if (status.ok() && response.status() == kvpb::KV_SUCCESS) {
++        return {kvpb::KV_SUCCESS, response.value()};
++      }
++      // KV_NOTLEADER, KV_TIMEOUT, or gRPC failure — rotate to next node
++      rotate_leader();
++      std::this_thread::sleep_for(std::chrono::milliseconds(100));
++    }
++    return {kvpb::KV_TIMEOUT, ""};
++  }
++
++  kvpb::KvStatus append(const std::string &key, const std::string &value) {
++    uint64_t seq = ++seq_num_;
++    for (int attempt = 0; attempt < max_attempts_; ++attempt) {
++      kvpb::AppendRequest request;
++      request.set_key(key);
++      request.set_value(value);
++      request.set_client_id(client_id_);
++      request.set_seq_num(seq);
++
++      kvpb::KvResponse response;
++      grpc::ClientContext context;
++      context.set_deadline(std::chrono::system_clock::now() +
++                           rpc_timeout_);
++
++      auto status =
++          stubs_[leader_idx_]->Append(&context, request, &response);
++      if (status.ok() && response.status() == kvpb::KV_SUCCESS) {
++        return kvpb::KV_SUCCESS;
++      }
++      // KV_NOTLEADER, KV_TIMEOUT, or gRPC failure — rotate to next node
++      rotate_leader();
++      std::this_thread::sleep_for(std::chrono::milliseconds(100));
++    }
++    return kvpb::KV_TIMEOUT;
++  }
++
++  uint64_t client_id() const { return client_id_; }
++
++private:
++  void rotate_leader() {
++    leader_idx_ = (leader_idx_ + 1) % stubs_.size();
++  }
++
++  std::vector<std::unique_ptr<kvpb::KvService::Stub>> stubs_;
++  uint64_t client_id_;
++  std::atomic<uint64_t> seq_num_;
++  size_t leader_idx_;
++
++  static constexpr int max_attempts_ = 50;
++  static constexpr std::chrono::seconds rpc_timeout_{5};
++};
++
++} // namespace kv
+diff --git a/inc/kv/kv_server.hpp b/inc/kv/kv_server.hpp
+new file mode 100644
+index 0000000..9f59781
+--- /dev/null
++++ b/inc/kv/kv_server.hpp
+@@ -0,0 +1,108 @@
++#pragma once
++
++#include <cstdint>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++
++#include <grpcpp/grpcpp.h>
++
++#include "common/common.hpp"
++#include "kv.grpc.pb.h"
++#include "rafty/raft.hpp"
++
++namespace kv {
++
++class KvServer : public kvpb::KvService::Service {
++public:
++  explicit KvServer(rafty::Raft &raft) : raft_(raft) {
++    // TODO (lab 3): initialize your data structures here.
++    // You may want to start background threads, set up condition variables, etc.
++  }
++
++  ~KvServer() {
++    // TODO (lab 3): clean up any background threads.
++  }
++
++  // -----------------------------------------------------------------
++  // on_apply is called by the node wrapper each time Raft commits a
++  // log entry. The ApplyResult contains the index and data of the
++  // committed entry (the same string you passed to raft_.propose()).
++  //
++  // You should:
++  //   1. Deserialize the operation from result.data
++  //   2. Apply it to your in-memory key/value map
++  //   3. Handle RIFL duplicate detection
++  //   4. Notify the waiting RPC handler that its operation has committed
++  // -----------------------------------------------------------------
++  void on_apply(const rafty::ApplyResult &result) {
++    // TODO (lab 3): implement this.
++    (void)result;
++  }
++
++  // -----------------------------------------------------------------
++  // gRPC handlers for client operations.
++  //
++  // Each handler should:
++  //   1. Check if this node is the Raft leader (if not, return KV_NOTLEADER)
++  //   2. Serialize the operation into a string
++  //   3. Call raft_.propose(serialized_op) to submit to Raft
++  //   4. Wait for on_apply() to process the committed entry at the
++  //      returned index
++  //   5. Return the result to the client
++  //
++  // Use RIFL (client_id + seq_num) to detect and handle duplicate
++  // requests, just like Lab 0b.
++  // -----------------------------------------------------------------
++
++  grpc::Status Put(grpc::ServerContext *context,
++                   const kvpb::PutRequest *request,
++                   kvpb::KvResponse *response) override {
++    // TODO (lab 3): implement
++    (void)context;
++    (void)request;
++    response->set_status(kvpb::KV_TIMEOUT);
++    return grpc::Status::OK;
++  }
++
++  grpc::Status Get(grpc::ServerContext *context,
++                   const kvpb::GetRequest *request,
++                   kvpb::GetResponse *response) override {
++    // TODO (lab 3): implement
++    (void)context;
++    (void)request;
++    response->set_status(kvpb::KV_TIMEOUT);
++    return grpc::Status::OK;
++  }
++
++  grpc::Status Append(grpc::ServerContext *context,
++                      const kvpb::AppendRequest *request,
++                      kvpb::KvResponse *response) override {
++    // TODO (lab 3): implement
++    (void)context;
++    (void)request;
++    response->set_status(kvpb::KV_TIMEOUT);
++    return grpc::Status::OK;
++  }
++
++private:
++  rafty::Raft &raft_;
++
++  // TODO (lab 3): add your state here. Consider:
++  //
++  // - std::unordered_map<std::string, std::string> store_;
++  //       The in-memory key/value map.
++  //
++  // - RIFL tables: track (client_id -> highest seq_num) and cache the
++  //   response for the last operation per client, so that duplicate
++  //   requests return the cached result instead of re-executing.
++  //
++  // - A notification mechanism (e.g., std::condition_variable or
++  //   std::promise/std::future per pending request) so that RPC handler
++  //   threads can wait for their specific log entry to be committed
++  //   and applied via on_apply().
++  //
++  // - std::mutex for protecting shared state.
++};
++
++} // namespace kv
+diff --git a/integration_tests/CMakeLists.txt b/integration_tests/CMakeLists.txt
+index faafe55..ba39ce5 100644
+--- a/integration_tests/CMakeLists.txt
++++ b/integration_tests/CMakeLists.txt
+@@ -9,8 +9,8 @@ foreach(test_source ${TEST_SOURCES})
+     add_executable(${test_name} ${test_source} ${absl_INCLUDE_DIRS} ${Protobuf_INCLUDE_DIRS} )
+ 
+     if (TRACING)
+-        target_link_libraries(${test_name} PRIVATE 
+-            rafty raft_grpc_proto tester_grpc_proto
++        target_link_libraries(${test_name} PRIVATE
++            rafty raft_grpc_proto tester_grpc_proto kv_grpc_proto
+             gtest gtest_main
+             absl::flags
+             absl::flags_parse
+@@ -22,8 +22,8 @@ foreach(test_source ${TEST_SOURCES})
+             opentelemetry_contrib::spdlog_sink
+         )
+     else()
+-        target_link_libraries(${test_name} PRIVATE 
+-            rafty raft_grpc_proto tester_grpc_proto
++        target_link_libraries(${test_name} PRIVATE
++            rafty raft_grpc_proto tester_grpc_proto kv_grpc_proto
+             gtest gtest_main
+             absl::flags
+             absl::flags_parse
+diff --git a/integration_tests/kv_test.cpp b/integration_tests/kv_test.cpp
+new file mode 100644
+index 0000000..312f682
+--- /dev/null
++++ b/integration_tests/kv_test.cpp
+@@ -0,0 +1,360 @@
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <format>
++#include <future>
++#include <memory>
++#include <string>
++#include <thread>
++#include <unordered_map>
++#include <vector>
++
++#include <ddb/integration.hpp>
++
++#include "absl/flags/flag.h"
++#include "absl/flags/parse.h"
++
++#include <gtest/gtest.h>
++
++#include "common/logger.hpp"
++#include "toolings/config_gen.hpp"
++#include "toolings/test_config.hpp"
++#include "toolings/test_ctrl.hpp"
++
++#include "kv/kv_client.hpp"
++
++using namespace toolings;
++
++static constexpr uint64_t KV_PORT_OFFSET = 1000;
++static const std::string KV_NODE_APP_PATH = "../app/kv_node";
++
++ABSL_FLAG(int, tester_verb, 1, "Tester verbosity level");
++ABSL_FLAG(int, raft_node_verb, 0, "Raft node verbosity level");
++ABSL_FLAG(bool, ddb, false, "Enable DDB for debugging.");
++ABSL_FLAG(std::string, ddb_host_ip, "127.0.0.1", "Host IP for DDB.");
++ABSL_FLAG(bool, wait_for_attach, true, "Wait for DDB attach.");
++ABSL_FLAG(bool, ddb_app_wrapper, true, "Use DDB app wrapper.");
++
++static DDBConfig ddb_conf;
++
++// ---------------------------------------------------------------------------
++// KvTestFixture: manages a 3-replica KV cluster for each test.
++// ---------------------------------------------------------------------------
++class KvTestFixture : public ::testing::Test {
++protected:
++  static constexpr uint64_t NUM_NODES = 3;
++  static constexpr uint64_t RAFT_BASE_PORT = 50050;
++
++  void SetUp() override {
++    rafty::utils::init_logger();
++
++    auto test_name = ::testing::UnitTest::GetInstance()
++                         ->current_test_info()
++                         ->name();
++    auto logger_name = std::format("kv_test_{}", test_name);
++    logger = spdlog::get(logger_name);
++    if (!logger) {
++      logger = spdlog::basic_logger_mt(
++          logger_name, std::format("logs/{}.log", logger_name), true);
++    }
++
++    // Generate configs
++    auto insts =
++        ConfigGen::gen_local_instances(NUM_NODES, RAFT_BASE_PORT);
++
++    std::unordered_map<uint64_t, uint64_t> node_tester_ports;
++    uint64_t tester_port = 55001;
++
++    for (const auto &inst : insts) {
++      std::map<uint64_t, std::string> peer_addrs;
++      for (const auto &peer : insts) {
++        if (peer.id == inst.id)
++          continue;
++        peer_addrs[peer.id] = peer.external_addr;
++      }
++      rafty::Config config = {
++          .id = inst.id, .addr = inst.listening_addr, .peer_addrs = peer_addrs};
++      configs.push_back(config);
++      node_tester_ports[inst.id] = tester_port++;
++
++      // KV client addresses (raft port + offset)
++      kv_addrs.push_back(
++          "localhost:" + std::to_string(inst.port + KV_PORT_OFFSET));
++    }
++
++    // Spawn kv_node processes
++    const std::string ctrl_addr = "0.0.0.0:55000";
++    ctrl = std::make_unique<RaftTestCtrl>(configs, node_tester_ports,
++                                         KV_NODE_APP_PATH, ctrl_addr, 0,
++                                         absl::GetFlag(FLAGS_raft_node_verb),
++                                         logger, ddb_conf);
++
++    // Register a no-op applier (KvServer handles apply internally)
++    ctrl->register_applier_handler(
++        [this](testerpb::ApplyResult m) -> void {
++          (void)m;
++        });
++
++    ctrl->run();
++
++    // Wait for cluster to stabilize
++    std::this_thread::sleep_for(std::chrono::seconds(2));
++  }
++
++  void TearDown() override {
++    if (ctrl) {
++      ctrl->kill();
++    }
++  }
++
++  std::unique_ptr<kv::KvClient> make_client() {
++    return std::make_unique<kv::KvClient>(kv_addrs);
++  }
++
++  void disconnect(uint64_t id) { ctrl->disconnect({id}); }
++  void reconnect(uint64_t id) { ctrl->reconnect({id}); }
++
++  std::shared_ptr<spdlog::logger> logger;
++  std::unique_ptr<RaftTestCtrl> ctrl;
++  std::vector<rafty::Config> configs;
++  std::vector<std::string> kv_addrs;
++};
++
++// ---------------------------------------------------------------------------
++// Test: Basic Put/Get/Append operations
++// ---------------------------------------------------------------------------
++TEST_F(KvTestFixture, BasicOpsC) {
++  auto client = make_client();
++
++  // Put and Get
++  auto status = client->put("key1", "hello");
++  ASSERT_EQ(status, kvpb::KV_SUCCESS) << "Put failed";
++
++  auto [get_status, val] = client->get("key1");
++  ASSERT_EQ(get_status, kvpb::KV_SUCCESS) << "Get failed";
++  ASSERT_EQ(val, "hello") << "Got wrong value";
++
++  // Append
++  status = client->append("key1", " world");
++  ASSERT_EQ(status, kvpb::KV_SUCCESS) << "Append failed";
++
++  auto [get_status2, val2] = client->get("key1");
++  ASSERT_EQ(get_status2, kvpb::KV_SUCCESS) << "Get after append failed";
++  ASSERT_EQ(val2, "hello world") << "Append result incorrect";
++
++  // Get non-existent key
++  auto [get_status3, val3] = client->get("nonexistent");
++  ASSERT_EQ(get_status3, kvpb::KV_SUCCESS) << "Get nonexistent failed";
++  ASSERT_EQ(val3, "") << "Nonexistent key should return empty string";
++}
++
++// ---------------------------------------------------------------------------
++// Test: Multiple keys
++// ---------------------------------------------------------------------------
++TEST_F(KvTestFixture, MultiKeyC) {
++  auto client = make_client();
++
++  for (int i = 0; i < 10; i++) {
++    auto key = "key" + std::to_string(i);
++    auto value = "value" + std::to_string(i);
++    auto status = client->put(key, value);
++    ASSERT_EQ(status, kvpb::KV_SUCCESS) << "Put " << key << " failed";
++  }
++
++  for (int i = 0; i < 10; i++) {
++    auto key = "key" + std::to_string(i);
++    auto expected = "value" + std::to_string(i);
++    auto [status, val] = client->get(key);
++    ASSERT_EQ(status, kvpb::KV_SUCCESS) << "Get " << key << " failed";
++    ASSERT_EQ(val, expected) << "Value mismatch for " << key;
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Test: Concurrent clients operating on different keys
++// ---------------------------------------------------------------------------
++TEST_F(KvTestFixture, ConcurrentC) {
++  constexpr int NUM_CLIENTS = 5;
++  constexpr int OPS_PER_CLIENT = 20;
++
++  std::vector<std::future<bool>> futs;
++  for (int c = 0; c < NUM_CLIENTS; c++) {
++    futs.push_back(std::async(std::launch::async, [this, c]() {
++      auto client = make_client();
++      for (int i = 0; i < OPS_PER_CLIENT; i++) {
++        auto key = std::format("client{}_key{}", c, i);
++        auto value = std::format("client{}_val{}", c, i);
++        if (client->put(key, value) != kvpb::KV_SUCCESS)
++          return false;
++        auto [status, val] = client->get(key);
++        if (status != kvpb::KV_SUCCESS || val != value)
++          return false;
++      }
++      return true;
++    }));
++  }
++
++  for (auto &f : futs) {
++    ASSERT_TRUE(f.get()) << "Concurrent client operations failed";
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Test: Operations survive leader failure and re-election
++// ---------------------------------------------------------------------------
++TEST_F(KvTestFixture, LeaderFailureC) {
++  auto client = make_client();
++
++  // Write some data
++  ASSERT_EQ(client->put("survive", "value1"), kvpb::KV_SUCCESS);
++
++  // Find and disconnect the leader
++  auto states = ctrl->get_all_states();
++  uint64_t leader_id = UINT64_MAX;
++  for (const auto &s : states) {
++    if (s.is_leader()) {
++      leader_id = s.id();
++      break;
++    }
++  }
++
++  if (leader_id != UINT64_MAX) {
++    disconnect(leader_id);
++    logger->info("Disconnected leader {}", leader_id);
++  }
++
++  // Wait for re-election
++  std::this_thread::sleep_for(std::chrono::seconds(3));
++
++  // Operations should still work (new leader elected)
++  auto [status, val] = client->get("survive");
++  ASSERT_EQ(status, kvpb::KV_SUCCESS) << "Get after leader failure failed";
++  ASSERT_EQ(val, "value1") << "Data lost after leader failure";
++
++  // New writes should work
++  ASSERT_EQ(client->put("survive2", "value2"), kvpb::KV_SUCCESS);
++
++  // Reconnect old leader
++  if (leader_id != UINT64_MAX) {
++    reconnect(leader_id);
++  }
++
++  std::this_thread::sleep_for(std::chrono::seconds(2));
++
++  // Verify data consistent
++  auto [s2, v2] = client->get("survive2");
++  ASSERT_EQ(s2, kvpb::KV_SUCCESS);
++  ASSERT_EQ(v2, "value2");
++}
++
++// ---------------------------------------------------------------------------
++// Test: Minority partition cannot serve reads (stale read prevention)
++// ---------------------------------------------------------------------------
++TEST_F(KvTestFixture, PartitionStaleReadC) {
++  auto client = make_client();
++
++  ASSERT_EQ(client->put("partition_key", "original"), kvpb::KV_SUCCESS);
++
++  // Partition one node (disconnect 2 out of 3 from node 0's perspective)
++  // Disconnect nodes 1 and 2 to isolate node 0
++  disconnect(1);
++  disconnect(2);
++
++  std::this_thread::sleep_for(std::chrono::seconds(3));
++
++  // The partitioned node should not be able to serve reads
++  // (it's alone and can't confirm majority)
++  // The client should eventually timeout or find another leader
++  // Since nodes 1 and 2 are disconnected from ALL peers, no majority exists
++  // Client retries should eventually timeout
++
++  // Reconnect to restore the cluster
++  reconnect(1);
++  reconnect(2);
++
++  std::this_thread::sleep_for(std::chrono::seconds(3));
++
++  // Now operations should work again
++  auto [status, val] = client->get("partition_key");
++  ASSERT_EQ(status, kvpb::KV_SUCCESS);
++  ASSERT_EQ(val, "original");
++}
++
++// ---------------------------------------------------------------------------
++// Test: Concurrent appends to the same key are linearizable
++// ---------------------------------------------------------------------------
++TEST_F(KvTestFixture, ConcurrentAppendC) {
++  constexpr int NUM_CLIENTS = 3;
++  constexpr int APPENDS_PER_CLIENT = 10;
++
++  auto setup_client = make_client();
++  ASSERT_EQ(setup_client->put("shared", ""), kvpb::KV_SUCCESS);
++
++  std::vector<std::future<bool>> futs;
++  for (int c = 0; c < NUM_CLIENTS; c++) {
++    futs.push_back(std::async(std::launch::async, [this, c]() {
++      auto client = make_client();
++      for (int i = 0; i < APPENDS_PER_CLIENT; i++) {
++        auto val = std::format("c{}i{} ", c, i);
++        if (client->append("shared", val) != kvpb::KV_SUCCESS)
++          return false;
++      }
++      return true;
++    }));
++  }
++
++  for (auto &f : futs) {
++    ASSERT_TRUE(f.get()) << "Concurrent append failed";
++  }
++
++  // Verify the total number of appended tokens
++  auto [status, val] = setup_client->get("shared");
++  ASSERT_EQ(status, kvpb::KV_SUCCESS);
++
++  // Count the number of space-separated tokens
++  int token_count = 0;
++  std::istringstream iss(val);
++  std::string token;
++  while (iss >> token) {
++    token_count++;
++  }
++  ASSERT_EQ(token_count, NUM_CLIENTS * APPENDS_PER_CLIENT)
++      << "Expected " << NUM_CLIENTS * APPENDS_PER_CLIENT
++      << " appended tokens, got " << token_count;
++}
++
++// ---------------------------------------------------------------------------
++// Test: Put overwrites previous value
++// ---------------------------------------------------------------------------
++TEST_F(KvTestFixture, PutOverwriteC) {
++  auto client = make_client();
++
++  ASSERT_EQ(client->put("overwrite", "v1"), kvpb::KV_SUCCESS);
++  auto [s1, v1] = client->get("overwrite");
++  ASSERT_EQ(v1, "v1");
++
++  ASSERT_EQ(client->put("overwrite", "v2"), kvpb::KV_SUCCESS);
++  auto [s2, v2] = client->get("overwrite");
++  ASSERT_EQ(v2, "v2");
++
++  ASSERT_EQ(client->put("overwrite", "v3"), kvpb::KV_SUCCESS);
++  auto [s3, v3] = client->get("overwrite");
++  ASSERT_EQ(v3, "v3");
++}
++
++// ---------------------------------------------------------------------------
++// main
++// ---------------------------------------------------------------------------
++int main(int argc, char **argv) {
++  ::testing::InitGoogleTest(&argc, argv);
++  absl::ParseCommandLine(argc, argv);
++
++  ddb_conf = DDBConfig{
++      .enable_ddb = absl::GetFlag(FLAGS_ddb),
++      .ddb_host_ip = absl::GetFlag(FLAGS_ddb_host_ip),
++      .wait_for_attach = absl::GetFlag(FLAGS_wait_for_attach),
++      .ddb_app_wrapper = absl::GetFlag(FLAGS_ddb_app_wrapper)};
++
++  return RUN_ALL_TESTS();
++}
+diff --git a/proto/CMakeLists.txt b/proto/CMakeLists.txt
+index 9e27966..d0804e1 100644
+--- a/proto/CMakeLists.txt
++++ b/proto/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ # Proto file
+ get_filename_component(raft_proto "./raft.proto" ABSOLUTE)
+ get_filename_component(tester_proto "./tester.proto" ABSOLUTE)
++get_filename_component(kv_proto "./kv.proto" ABSOLUTE)
+ get_filename_component(raft_proto_path "${raft_proto}" PATH)
+ 
+ set(raft_proto_srcs "${CMAKE_CURRENT_BINARY_DIR}/raft.pb.cc")
+@@ -13,15 +14,20 @@ set(tester_proto_hdrs "${CMAKE_CURRENT_BINARY_DIR}/tester.pb.h")
+ set(tester_grpc_srcs "${CMAKE_CURRENT_BINARY_DIR}/tester.grpc.pb.cc")
+ set(tester_grpc_hdrs "${CMAKE_CURRENT_BINARY_DIR}/tester.grpc.pb.h")
+ 
++set(kv_proto_srcs "${CMAKE_CURRENT_BINARY_DIR}/kv.pb.cc")
++set(kv_proto_hdrs "${CMAKE_CURRENT_BINARY_DIR}/kv.pb.h")
++set(kv_grpc_srcs "${CMAKE_CURRENT_BINARY_DIR}/kv.grpc.pb.cc")
++set(kv_grpc_hdrs "${CMAKE_CURRENT_BINARY_DIR}/kv.grpc.pb.h")
++
+ add_custom_command(
+-      OUTPUT "${raft_proto_srcs}" "${raft_proto_hdrs}" "${raft_grpc_srcs}" "${raft_grpc_hdrs}" "${tester_proto_srcs}" "${tester_proto_hdrs}" "${tester_grpc_srcs}" "${tester_grpc_hdrs}"
++      OUTPUT "${raft_proto_srcs}" "${raft_proto_hdrs}" "${raft_grpc_srcs}" "${raft_grpc_hdrs}" "${tester_proto_srcs}" "${tester_proto_hdrs}" "${tester_grpc_srcs}" "${tester_grpc_hdrs}" "${kv_proto_srcs}" "${kv_proto_hdrs}" "${kv_grpc_srcs}" "${kv_grpc_hdrs}"
+       COMMAND ${_PROTOBUF_PROTOC}
+       ARGS --grpc_out "${CMAKE_CURRENT_BINARY_DIR}"
+         --cpp_out "${CMAKE_CURRENT_BINARY_DIR}"
+         -I "${raft_proto_path}"
+         --plugin=protoc-gen-grpc="${_GRPC_CPP_PLUGIN_EXECUTABLE}"
+-        "${raft_proto}" "${tester_proto}"
+-      DEPENDS "${raft_proto}" "${tester_proto}")
++        "${raft_proto}" "${tester_proto}" "${kv_proto}"
++      DEPENDS "${raft_proto}" "${tester_proto}" "${kv_proto}")
+ 
+ # Include generated *.pb.h files
+ include_directories("${CMAKE_CURRENT_BINARY_DIR}")
+@@ -53,7 +59,21 @@ target_link_libraries(tester_grpc_proto
+   ${_PROTOBUF_LIBPROTOBUF}
+ )
+ 
+-add_custom_target(generate_proto_files ALL DEPENDS 
++add_library(kv_grpc_proto STATIC
++  ${kv_grpc_srcs}
++  ${kv_grpc_hdrs}
++  ${kv_proto_srcs}
++  ${kv_proto_hdrs}
++)
++
++target_link_libraries(kv_grpc_proto
++  absl::check
++  ${_REFLECTION}
++  ${_GRPC_GRPCPP}
++  ${_PROTOBUF_LIBPROTOBUF}
++)
++
++add_custom_target(generate_proto_files ALL DEPENDS
+   ${raft_proto_srcs}
+   ${raft_proto_hdrs}
+   ${raft_grpc_srcs}
+@@ -62,6 +82,10 @@ add_custom_target(generate_proto_files ALL DEPENDS
+   ${tester_proto_hdrs}
+   ${tester_grpc_srcs}
+   ${tester_grpc_hdrs}
++  ${kv_proto_srcs}
++  ${kv_proto_hdrs}
++  ${kv_grpc_srcs}
++  ${kv_grpc_hdrs}
+ )
+ 
+ # Create the generated directory if it doesn't exist
+diff --git a/proto/kv.proto b/proto/kv.proto
+new file mode 100644
+index 0000000..2b68780
+--- /dev/null
++++ b/proto/kv.proto
+@@ -0,0 +1,44 @@
++syntax = "proto3";
++
++package kvpb;
++
++service KvService {
++  rpc Put(PutRequest) returns (KvResponse) {}
++  rpc Get(GetRequest) returns (GetResponse) {}
++  rpc Append(AppendRequest) returns (KvResponse) {}
++}
++
++enum KvStatus {
++  KV_SUCCESS = 0;
++  KV_NOTLEADER = 1;
++  KV_TIMEOUT = 2;
++}
++
++message PutRequest {
++  string key = 1;
++  string value = 2;
++  uint64 client_id = 3;  // RIFL: unique client identifier
++  uint64 seq_num = 4;    // RIFL: monotonically increasing per-client sequence number
++}
++
++message GetRequest {
++  string key = 1;
++  uint64 client_id = 2;
++  uint64 seq_num = 3;
++}
++
++message AppendRequest {
++  string key = 1;
++  string value = 2;
++  uint64 client_id = 3;
++  uint64 seq_num = 4;
++}
++
++message KvResponse {
++  KvStatus status = 1;
++}
++
++message GetResponse {
++  KvStatus status = 1;
++  string value = 2;
++}
+-- 
+2.50.1 (Apple Git-155)
+
