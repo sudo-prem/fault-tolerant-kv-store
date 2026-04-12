@@ -48,11 +48,25 @@ public:
       std::lock_guard<std::mutex> lk(mu_);
 
       auto dedup_it = dedup_.find(op->client_id);
-      if (dedup_it != dedup_.end() && op->seq_num <= dedup_it->second.seq_num) {
-        // Duplicate RPC: return cached result without re-executing.
+      if (dedup_it != dedup_.end()) {
+        auto cached_it = dedup_it->second.by_seq.find(op->seq_num);
+        if (cached_it != dedup_it->second.by_seq.end()) {
+          // Exact duplicate RPC: return cached result without re-executing.
+          is_dup = true;
+          status = cached_it->second.status;
+          value = cached_it->second.value;
+        }
+      }
+
+      if (!is_dup && dedup_it != dedup_.end() &&
+          op->seq_num < dedup_it->second.max_seq) {
+        // Old/superseded request: do not re-execute an already-seen sequence.
         is_dup = true;
-        status = dedup_it->second.status;
-        value = dedup_it->second.value;
+        auto latest_it = dedup_it->second.by_seq.find(dedup_it->second.max_seq);
+        if (latest_it != dedup_it->second.by_seq.end()) {
+          status = latest_it->second.status;
+          value = latest_it->second.value;
+        }
       }
 
       if (!is_dup) {
@@ -65,11 +79,14 @@ public:
           value = (it == store_.end()) ? "" : it->second;
         }
 
-        dedup_[op->client_id] = ClientCache{
-            .seq_num = op->seq_num,
+        auto &history = dedup_[op->client_id];
+        history.by_seq[op->seq_num] = ClientCache{
             .status = status,
             .value = value,
         };
+        if (op->seq_num > history.max_seq) {
+          history.max_seq = op->seq_num;
+        }
       }
 
       // Record applied results so waiters arriving after apply still resolve.
@@ -202,9 +219,13 @@ private:
   };
 
   struct ClientCache {
-    uint64_t seq_num;
     kvpb::KvStatus status;
     std::string value;
+  };
+
+  struct ClientHistory {
+    uint64_t max_seq = 0;
+    std::unordered_map<uint64_t, ClientCache> by_seq;
   };
 
   struct Pending {
@@ -343,8 +364,11 @@ private:
                                                     uint64_t seq_num) {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = dedup_.find(client_id);
-    if (it != dedup_.end() && seq_num <= it->second.seq_num) {
-      return it->second;
+    if (it != dedup_.end()) {
+      auto cached_it = it->second.by_seq.find(seq_num);
+      if (cached_it != it->second.by_seq.end()) {
+        return cached_it->second;
+      }
     }
     return std::nullopt;
   }
@@ -395,7 +419,7 @@ private:
   std::condition_variable cv_;
 
   std::unordered_map<std::string, std::string> store_;
-  std::unordered_map<uint64_t, ClientCache> dedup_;
+  std::unordered_map<uint64_t, ClientHistory> dedup_;
   std::unordered_map<uint64_t, Pending> pending_by_index_;
   std::unordered_map<uint64_t, AppliedEntry> applied_by_index_;
   std::deque<uint64_t> applied_order_;
