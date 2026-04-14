@@ -19,24 +19,24 @@ namespace rafty {
         grpc::reflection::InitProtoReflectionServerBuilderPlugin();
 
         ServerBuilder builder;
-        builder.AddListeningPort(this->listening_addr, grpc::InsecureServerCredentials());
+        builder.AddListeningPort(listening_addr, grpc::InsecureServerCredentials());
 
 #ifdef TRACING
         builder.experimental().SetInterceptorCreators(tracing::CreateServerTracingInterceptors());
 #endif
 
-        builder.RegisterService(this->service_.get());
+        builder.RegisterService(service_.get());
 
         std::unique_ptr<Server> server(builder.BuildAndStart());
         logger->info("Raft server {} listening on {}", id, listening_addr);
 
-        this->server_ = std::move(server);
+        server_ = std::move(server);
 
-        std::thread([this] { this->server_->Wait(); }).detach();
+        std::thread([this] { server_->Wait(); }).detach();
     }
 
     inline void Raft::stop_server() {
-        if(this->server_) { this->server_->Shutdown(); }
+        if(server_) { server_->Shutdown(); }
     }
 
     inline void Raft::connect_peers() {
@@ -64,20 +64,20 @@ namespace rafty {
         }
     }
 
-    inline bool Raft::is_dead() const { return this->dead.load(); }
+    inline bool Raft::is_dead() const { return dead.load(); }
 
     inline void Raft::kill() {
-        this->dead.store(true);
+        dead.store(true);
         // add your code here if needed.
     }
 
     inline std::unique_ptr<grpc::ClientContext> Raft::create_context(uint64_t to) const {
         std::unique_ptr<grpc::ClientContext> context = std::make_unique<grpc::ClientContext>();
-        context->AddMetadata("from", std::to_string(this->id));
+        context->AddMetadata("from", std::to_string(id));
         context->AddMetadata("to", std::to_string(to));
         return context;
     }
 
-    inline void Raft::apply(const ApplyResult &result) { this->ready_queue.enqueue(result); }
+    inline void Raft::apply(const ApplyResult &result) { ready_queue.enqueue(result); }
 
 } // namespace rafty
