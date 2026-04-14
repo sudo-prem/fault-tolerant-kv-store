@@ -27,7 +27,7 @@ namespace rafty {
 
         builder.RegisterService(service_.get());
 
-        std::unique_ptr<Server> server(builder.BuildAndStart());
+        auto server = builder.BuildAndStart();
         logger->info("Raft server {} listening on {}", id, listening_addr);
 
         server_ = std::move(server);
@@ -72,7 +72,7 @@ namespace rafty {
     }
 
     inline std::unique_ptr<grpc::ClientContext> Raft::create_context(uint64_t to) const {
-        std::unique_ptr<grpc::ClientContext> context = std::make_unique<grpc::ClientContext>();
+        auto context = std::make_unique<grpc::ClientContext>();
         context->AddMetadata("from", std::to_string(id));
         context->AddMetadata("to", std::to_string(to));
         return context;
