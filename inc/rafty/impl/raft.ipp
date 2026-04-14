@@ -52,8 +52,8 @@ namespace rafty {
         for(const auto &peer_addr : peer_addrs) {
             logger->info("Connecting to peer {} at {}", peer_addr.first, peer_addr.second);
             std::vector<std::unique_ptr<ClientInterceptorFactoryInterface>> interceptor_creators;
-            interceptor_creators.push_back(std::make_unique<ByteCountingInterceptorFactory>());
-            interceptor_creators.push_back(std::make_unique<NetInterceptorFactory>());
+            interceptor_creators.emplace_back(std::make_unique<ByteCountingInterceptorFactory>());
+            interceptor_creators.emplace_back(std::make_unique<NetInterceptorFactory>());
 #ifdef TRACING
             interceptor_creators.push_back(std::make_unique<tracing::TracingClientInterceptorFactory>());
 #endif
