@@ -15,6 +15,10 @@ namespace rafty {
     using grpc::experimental::CreateCustomChannelWithInterceptors;
 
     namespace {
+        const std::chrono::milliseconds kTickerSleepInterval{ 4 };
+    }
+
+    namespace {
         class RaftRpcHandler final : public raftpb::RaftService::Service {
         public:
             explicit RaftRpcHandler(Raft *raft) : raft_(raft) {}
@@ -525,7 +529,7 @@ namespace rafty {
             if(should_send_heartbeat) { this->send_heartbeats_once(); }
             if(should_request_votes) { this->send_request_votes_once(vote_request_term); }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            std::this_thread::sleep_for(kTickerSleepInterval);
         }
     }
 
