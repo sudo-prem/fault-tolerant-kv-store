@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -59,13 +60,9 @@ namespace {
 
     double percentile_from_sorted(const std::vector<double> &sorted, double percentile) {
         if(sorted.empty()) { return 0.0; }
-        if(sorted.size() == 1) { return sorted.front(); }
 
-        const double rank = (percentile / 100.0) * static_cast<double>(sorted.size() - 1);
-        const size_t lower_idx = static_cast<size_t>(rank);
-        const size_t upper_idx = std::min(sorted.size() - 1, lower_idx + 1);
-        const double weight = rank - static_cast<double>(lower_idx);
-        return sorted[lower_idx] * (1.0 - weight) + sorted[upper_idx] * weight;
+        const size_t idx = static_cast<size_t>((percentile / 100.0) * static_cast<double>(sorted.size() - 1));
+        return sorted[idx];
     }
 
     LatencyStats compute_stats(std::vector<double> latencies_ms) {
@@ -83,9 +80,10 @@ namespace {
     }
 
     std::string resolve_kv_node_binary() {
-        const std::vector<std::string> candidates = {
+        const std::array<std::string, 4> candidates = {
             "./kv_node",
             "./build/app/kv_node",
+            "./app/kv_node",
             "../app/kv_node",
         };
 
@@ -251,6 +249,8 @@ namespace {
            << std::setw(12) << result.latency.p99_ms << std::setw(18) << result.throughput_ops_sec << "\n";
     }
 
+    bool round_has_failures(const RoundResult &result) { return result.success_ops != result.total_ops; }
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -285,8 +285,8 @@ int main(int argc, char **argv) {
 
     const std::string kv_node_bin = resolve_kv_node_binary();
     if(::access(kv_node_bin.c_str(), X_OK) != 0) {
-        std::cerr
-            << "Cannot find executable kv_node binary. Tried common paths such as ./kv_node and ./build/app/kv_node\n";
+        std::cerr << "Cannot find executable kv_node binary in ./kv_node, ./build/app/kv_node, ./app/kv_node, "
+                  << "or ../app/kv_node\n";
         return EXIT_FAILURE;
     }
 
@@ -299,6 +299,7 @@ int main(int argc, char **argv) {
     write_result_header(result_file);
     write_result_header(std::cout);
 
+    bool saw_any_round_failure = false;
     uint64_t round_idx = 0;
     for(uint64_t client_count = 1; client_count <= static_cast<uint64_t>(max_client_count);
         client_count <<= 1, ++round_idx) {
@@ -318,6 +319,14 @@ int main(int argc, char **argv) {
         const RoundResult result = run_round(client_count, put_ratio, cluster.kv_addrs);
         write_result_row(result_file, result);
         write_result_row(std::cout, result);
+        result_file.flush();
+
+        if(round_has_failures(result)) {
+            const uint64_t failed_ops = result.total_ops - result.success_ops;
+            std::cerr << "Round with " << client_count << " clients had " << failed_ops << " non-success operations ("
+                      << result.success_ops << "/" << result.total_ops << " succeeded).\n";
+            saw_any_round_failure = true;
+        }
 
         if(cluster.ctrl) {
             cluster.ctrl->kill();
@@ -329,5 +338,5 @@ int main(int argc, char **argv) {
     }
 
     std::cout << "Results written to result.txt" << std::endl;
-    return 0;
+    return saw_any_round_failure ? EXIT_FAILURE : EXIT_SUCCESS;
 }
