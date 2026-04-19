@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <iomanip>
@@ -35,14 +36,9 @@ namespace {
 
     double percentile_from_sorted(const std::vector<double> &sorted, double percentile) {
         if(sorted.empty()) { return 0.0; }
-        if(sorted.size() == 1) { return sorted.front(); }
 
-        const double rank = (percentile / 100.0) * static_cast<double>(sorted.size() - 1);
-        const size_t lower_idx = static_cast<size_t>(rank);
-        const size_t upper_idx = std::min(sorted.size() - 1, lower_idx + 1);
-        const double weight = rank - static_cast<double>(lower_idx);
-
-        return sorted[lower_idx] * (1.0 - weight) + sorted[upper_idx] * weight;
+        const size_t idx = static_cast<size_t>((percentile / 100.0) * static_cast<double>(sorted.size() - 1));
+        return sorted[idx];
     }
 
     LatencyStats compute_stats(std::vector<double> latencies_ms) {
@@ -59,9 +55,10 @@ namespace {
     }
 
     std::string resolve_kv_node_binary() {
-        const std::vector<std::string> candidates = {
+        const std::array<std::string, 4> candidates = {
             "./kv_node",
             "./build/app/kv_node",
+            "./app/kv_node",
             "../app/kv_node",
         };
 
@@ -105,8 +102,8 @@ int main() {
 
     const std::string kv_node_bin = resolve_kv_node_binary();
     if(::access(kv_node_bin.c_str(), X_OK) != 0) {
-        std::cerr
-            << "Cannot find executable kv_node binary. Tried common paths such as ./kv_node and ./build/app/kv_node\n";
+        std::cerr << "Cannot find executable kv_node binary in ./kv_node, ./build/app/kv_node, ./app/kv_node, "
+                  << "or ../app/kv_node\n";
         return EXIT_FAILURE;
     }
 
@@ -147,9 +144,14 @@ int main() {
     std::cout << std::fixed << std::setprecision(2) << std::setw(12) << stats.avg_ms << std::setw(13) << stats.p50_ms
               << std::setw(12) << stats.p99_ms << "\n";
 
-    if(failed_ops > 0) { std::cout << "warning: " << failed_ops << " operations returned non-success status\n"; }
-
     ctrl->kill();
     ctrl.reset();
-    return 0;
+
+    if(failed_ops > 0) {
+        std::cerr << "Latency benchmark failed: " << failed_ops << " out of " << kNumOperations
+                  << " requests did not return KV_SUCCESS\n";
+        return EXIT_FAILURE;
+    }
+
+    return EXIT_SUCCESS;
 }
