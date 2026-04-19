@@ -44,7 +44,7 @@ namespace rafty {
         this->voted_for_.reset();
 
         this->log_.clear();
-        this->log_.push_back(LogEntry{.index = 0, .term = 0, .data = ""});
+        this->log_.push_back(LogEntry{ .index = 0, .term = 0, .data = "" });
         this->commit_index_ = 0;
         this->last_applied_ = 0;
         this->next_index_.clear();
@@ -85,13 +85,11 @@ namespace rafty {
             .is_leader = leader,
         };
 
-        if(!leader) {
-            return result;
-        }
+        if(!leader) { return result; }
 
         const uint64_t index = this->last_log_index_locked() + 1;
         const uint64_t term = this->current_term_;
-        this->log_.push_back(LogEntry{.index = index, .term = term, .data = data});
+        this->log_.push_back(LogEntry{ .index = index, .term = term, .data = data });
 
         // Kick replication soon, do not wait for commit
         this->next_heartbeat_at_ = std::chrono::steady_clock::now();
@@ -100,13 +98,12 @@ namespace rafty {
         result.term = term;
 
         // Single node optimization: commit immediately
-        if(this->quorum_size() == 1 && this->commit_index_ < index && index < this->log_.size() && this->log_[index].term == this->current_term_) {
+        if(this->quorum_size() == 1 && this->commit_index_ < index && index < this->log_.size()
+           && this->log_[index].term == this->current_term_) {
             this->commit_index_ = index;
             auto applies = this->collect_newly_committed_applies_locked();
             lk.unlock();
-            for(const auto &a : applies) {
-                this->apply(a);
-            }
+            for(const auto &a : applies) { this->apply(a); }
             return result;
         }
 
@@ -114,20 +111,45 @@ namespace rafty {
     }
 
     ProposalResult Raft::propose_sync(const std::string &data) {
-        // TODO: lab 3
+        auto proposed = this->propose(data);
+        if(!proposed.is_leader || proposed.index == 0) { return proposed; }
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(4500);
+        while(!this->dead.load()) {
+            {
+                std::lock_guard<std::mutex> lk(this->mtx);
+
+                // Entry disappeared or was overwritten before commit.
+                if(proposed.index >= this->log_.size() || this->log_[proposed.index].term != proposed.term) {
+                    return ProposalResult{
+                        .index = 0,
+                        .term = this->current_term_,
+                        .is_leader = false,
+                    };
+                }
+
+                if(this->commit_index_ >= proposed.index) { return proposed; }
+            }
+
+            if(std::chrono::steady_clock::now() >= deadline) { break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+
+        std::lock_guard<std::mutex> lk(this->mtx);
+        return ProposalResult{
+            .index = 0,
+            .term = this->current_term_,
+            .is_leader = false,
+        };
     }
 
     uint64_t Raft::last_log_index_locked() const {
-        if(this->log_.empty()) {
-            return 0;
-        }
+        if(this->log_.empty()) { return 0; }
         return this->log_.back().index;
     }
 
     uint64_t Raft::last_log_term_locked() const {
-        if(this->log_.empty()) {
-            return 0;
-        }
+        if(this->log_.empty()) { return 0; }
         return this->log_.back().term;
     }
 
@@ -153,9 +175,7 @@ namespace rafty {
 
         std::sort(matches.begin(), matches.end());
         const uint64_t q = this->quorum_size();
-        if(q == 0 || matches.empty() || q > matches.size()) {
-            return 0;
-        }
+        if(q == 0 || matches.empty() || q > matches.size()) { return 0; }
         return matches[matches.size() - static_cast<size_t>(q)];
     }
 
@@ -163,11 +183,9 @@ namespace rafty {
         std::vector<ApplyResult> out;
         while(this->last_applied_ < this->commit_index_) {
             this->last_applied_ += 1;
-            if(this->last_applied_ >= this->log_.size()) {
-                break;
-            }
+            if(this->last_applied_ >= this->log_.size()) { break; }
             const auto &e = this->log_[this->last_applied_];
-            out.push_back(ApplyResult{.valid = true, .data = e.data, .index = e.index});
+            out.push_back(ApplyResult{ .valid = true, .data = e.data, .index = e.index });
         }
         return out;
     }
@@ -228,8 +246,8 @@ namespace rafty {
         }
     }
 
-    grpc::Status Raft::handle_append_entries_rpc(const raftpb::AppendEntriesRequest *request,
-                                                 raftpb::AppendEntriesReply *reply) {
+    grpc::Status
+    Raft::handle_append_entries_rpc(const raftpb::AppendEntriesRequest *request, raftpb::AppendEntriesReply *reply) {
         std::unique_lock<std::mutex> lk(this->mtx);
         const uint64_t req_term = request->term();
 
@@ -242,9 +260,7 @@ namespace rafty {
         if(req_term > this->current_term_) {
             this->become_follower_locked(req_term);
         } else {
-            if(this->role_ != Role::Follower) {
-                this->role_ = Role::Follower;
-            }
+            if(this->role_ != Role::Follower) { this->role_ = Role::Follower; }
         }
 
         // Valid leader contact for current term; prevent election
@@ -274,13 +290,11 @@ namespace rafty {
             const std::string in_data = incoming.command();
 
             if(idx < this->log_.size()) {
-                if(this->log_[idx].term != in_term) {
-                    this->log_.resize(idx);
-                }
+                if(this->log_[idx].term != in_term) { this->log_.resize(idx); }
             }
 
             if(idx == this->log_.size()) {
-                this->log_.push_back(LogEntry{.index = idx, .term = in_term, .data = in_data});
+                this->log_.push_back(LogEntry{ .index = idx, .term = in_term, .data = in_data });
             }
         }
 
@@ -294,13 +308,12 @@ namespace rafty {
 
         auto applies = this->collect_newly_committed_applies_locked();
         lk.unlock();
-        for(const auto &a : applies) {
-            this->apply(a);
-        }
+        for(const auto &a : applies) { this->apply(a); }
         return grpc::Status::OK;
     }
 
-    grpc::Status Raft::handle_request_vote_rpc(const raftpb::RequestVoteRequest *request, raftpb::RequestVoteReply *reply) {
+    grpc::Status
+    Raft::handle_request_vote_rpc(const raftpb::RequestVoteRequest *request, raftpb::RequestVoteReply *reply) {
         std::lock_guard<std::mutex> lk(this->mtx);
         const uint64_t req_term = request->term();
 
@@ -310,17 +323,16 @@ namespace rafty {
             return grpc::Status::OK;
         }
 
-        if(req_term > this->current_term_) {
-            this->become_follower_locked(req_term);
-        }
+        if(req_term > this->current_term_) { this->become_follower_locked(req_term); }
 
         const uint64_t local_last_log_term = this->last_log_term_locked();
         const uint64_t local_last_log_index = this->last_log_index_locked();
-        const bool candidate_up_to_date =
-            (request->last_log_term() > local_last_log_term) ||
-            (request->last_log_term() == local_last_log_term && request->last_log_index() >= local_last_log_index);
+        const bool candidate_up_to_date
+            = (request->last_log_term() > local_last_log_term)
+              || (request->last_log_term() == local_last_log_term && request->last_log_index() >= local_last_log_index);
 
-        const bool can_vote_for_candidate = !this->voted_for_.has_value() || this->voted_for_.value() == request->candidate_id();
+        const bool can_vote_for_candidate
+            = !this->voted_for_.has_value() || this->voted_for_.value() == request->candidate_id();
         const bool grant_vote = can_vote_for_candidate && candidate_up_to_date;
 
         if(grant_vote) {
@@ -345,17 +357,13 @@ namespace rafty {
 
         for(const auto &[peer_id, _] : this->peer_addrs) {
             auto stub_it = this->peers_.find(peer_id);
-            if(stub_it == this->peers_.end()) {
-                continue;
-            }
+            if(stub_it == this->peers_.end()) { continue; }
 
             raftpb::RequestVoteReply reply;
             auto context = this->create_context(peer_id);
             context->set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(200));
             grpc::Status status = stub_it->second->RequestVote(&*context, req, &reply);
-            if(!status.ok()) {
-                continue;
-            }
+            if(!status.ok()) { continue; }
 
             std::lock_guard<std::mutex> lk(this->mtx);
             if(reply.term() > this->current_term_) {
@@ -365,9 +373,7 @@ namespace rafty {
             }
 
             // Ignore stale replies from prior terms or after role changes
-            if(this->role_ != Role::Candidate || this->current_term_ != term) {
-                continue;
-            }
+            if(this->role_ != Role::Candidate || this->current_term_ != term) { continue; }
 
             if(reply.vote_granted()) {
                 this->votes_granted_in_term_ += 1;
@@ -393,28 +399,20 @@ namespace rafty {
 
         for(const auto &[peer_id, _] : this->peer_addrs) {
             auto stub_it = this->peers_.find(peer_id);
-            if(stub_it == this->peers_.end()) {
-                continue;
-            }
+            if(stub_it == this->peers_.end()) { continue; }
 
             AppendPlan plan;
             {
                 std::lock_guard<std::mutex> lk(this->mtx);
-                if(this->role_ != Role::Leader || this->dead.load()) {
-                    return;
-                }
+                if(this->role_ != Role::Leader || this->dead.load()) { return; }
 
                 const uint64_t last_index = this->last_log_index_locked();
                 auto it = this->next_index_.find(peer_id);
                 uint64_t next_index = (it == this->next_index_.end()) ? (last_index + 1) : it->second;
 
                 // Clamp next_index to a valid range
-                if(next_index < 1) {
-                    next_index = 1;
-                }
-                if(next_index > last_index + 1) {
-                    next_index = last_index + 1;
-                }
+                if(next_index < 1) { next_index = 1; }
+                if(next_index > last_index + 1) { next_index = last_index + 1; }
 
                 const uint64_t prev_index = next_index - 1;
                 const uint64_t prev_term = (prev_index < this->log_.size()) ? this->log_[prev_index].term : 0;
@@ -426,12 +424,11 @@ namespace rafty {
                 plan.prev_log_term = prev_term;
 
                 if(next_index <= last_index) {
-                    const uint64_t end = std::min<uint64_t>(last_index, next_index + static_cast<uint64_t>(kMaxEntriesPerAppend) - 1);
+                    const uint64_t end
+                        = std::min<uint64_t>(last_index, next_index + static_cast<uint64_t>(kMaxEntriesPerAppend) - 1);
                     plan.entries.reserve(static_cast<size_t>(end - next_index + 1));
                     for(uint64_t idx = next_index; idx <= end; idx++) {
-                        if(idx < this->log_.size()) {
-                            plan.entries.push_back(this->log_[idx]);
-                        }
+                        if(idx < this->log_.size()) { plan.entries.push_back(this->log_[idx]); }
                     }
                 }
             }
@@ -442,17 +439,13 @@ namespace rafty {
             req.set_prev_log_index(plan.prev_log_index);
             req.set_prev_log_term(plan.prev_log_term);
             req.set_leader_commit(plan.leader_commit);
-            for(const auto &e : plan.entries) {
-                *req.add_entries() = this->to_proto_entry(e);
-            }
+            for(const auto &e : plan.entries) { *req.add_entries() = this->to_proto_entry(e); }
 
             raftpb::AppendEntriesReply reply;
             auto context = this->create_context(peer_id);
             context->set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(200));
             grpc::Status status = stub_it->second->AppendEntries(&*context, req, &reply);
-            if(!status.ok()) {
-                continue;
-            }
+            if(!status.ok()) { continue; }
 
             if(reply.term() > plan.term) {
                 std::lock_guard<std::mutex> lk(this->mtx);
@@ -467,7 +460,8 @@ namespace rafty {
                 std::lock_guard<std::mutex> lk(this->mtx);
                 if(this->role_ == Role::Leader && this->current_term_ == plan.term) {
                     // Back up nextIndex aggressively to reduce retry rounds on diverged logs.
-                    const uint64_t cur = this->next_index_.contains(peer_id) ? this->next_index_[peer_id] : (plan.prev_log_index + 1);
+                    const uint64_t cur
+                        = this->next_index_.contains(peer_id) ? this->next_index_[peer_id] : (plan.prev_log_index + 1);
                     const uint64_t step = std::max<uint64_t>(1, (cur - 1) / 2);
                     this->next_index_[peer_id] = std::max<uint64_t>(1, cur - step);
                 }
@@ -477,9 +471,7 @@ namespace rafty {
             std::vector<ApplyResult> applies;
             {
                 std::lock_guard<std::mutex> lk(this->mtx);
-                if(this->role_ != Role::Leader || this->current_term_ != plan.term) {
-                    continue;
-                }
+                if(this->role_ != Role::Leader || this->current_term_ != plan.term) { continue; }
 
                 // Update follower progress - works for both empty and non-empty appends
                 const uint64_t advanced = plan.prev_log_index + static_cast<uint64_t>(plan.entries.size());
@@ -491,7 +483,8 @@ namespace rafty {
 
                 // Leader commit rule: commit N if a majority have replicated it and log[N].term == currentTerm
                 const uint64_t candidate = this->majority_match_index_locked();
-                if(candidate > this->commit_index_ && candidate < this->log_.size() && this->log_[candidate].term == this->current_term_) {
+                if(candidate > this->commit_index_ && candidate < this->log_.size()
+                   && this->log_[candidate].term == this->current_term_) {
                     this->commit_index_ = candidate;
                     // Propagate updated leaderCommit promptly
                     this->next_heartbeat_at_ = std::chrono::steady_clock::now();
@@ -499,9 +492,7 @@ namespace rafty {
 
                 applies = this->collect_newly_committed_applies_locked();
             }
-            for(const auto &a : applies) {
-                this->apply(a);
-            }
+            for(const auto &a : applies) { this->apply(a); }
         }
     }
 
@@ -523,8 +514,8 @@ namespace rafty {
                     this->start_election_locked();
                 }
 
-                if(this->election_needs_vote_requests_ && this->role_ == Role::Candidate &&
-                   this->pending_vote_request_term_ == this->current_term_) {
+                if(this->election_needs_vote_requests_ && this->role_ == Role::Candidate
+                   && this->pending_vote_request_term_ == this->current_term_) {
                     should_request_votes = true;
                     vote_request_term = this->current_term_;
                     this->election_needs_vote_requests_ = false;
