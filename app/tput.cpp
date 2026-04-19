@@ -27,7 +27,7 @@
 
 namespace {
 
-    constexpr uint64_t kNumNodes = 3;
+    constexpr uint64_t kDefaultNumNodes = 3;
     constexpr uint64_t kKvPortOffset = 1000;
     constexpr uint64_t kOpsPerClient = 1000;
     constexpr uint64_t kKeyspaceSize = 1000;
@@ -94,10 +94,10 @@ namespace {
         return "./kv_node";
     }
 
-    ClusterContext
-    start_cluster(uint64_t round_idx, const std::string &kv_node_bin, std::shared_ptr<spdlog::logger> logger) {
+    ClusterContext start_cluster(uint64_t round_idx, uint64_t num_nodes, const std::string &kv_node_bin,
+                                 std::shared_ptr<spdlog::logger> logger) {
         ClusterContext cluster;
-        cluster.kv_addrs.reserve(kNumNodes);
+        cluster.kv_addrs.reserve(num_nodes);
 
         const uint64_t raft_base_port = kInitialRaftPort + round_idx * kPortStridePerRound;
         const uint64_t ctrl_port = kInitialCtrlPort + round_idx * kPortStridePerRound;
@@ -106,7 +106,7 @@ namespace {
         std::vector<rafty::Config> configs;
         std::unordered_map<uint64_t, uint64_t> node_tester_ports;
 
-        const auto instances = toolings::ConfigGen::gen_local_instances(kNumNodes, raft_base_port);
+        const auto instances = toolings::ConfigGen::gen_local_instances(num_nodes, raft_base_port);
         uint64_t tester_port = tester_port_base;
         for(const auto &inst : instances) {
             std::map<uint64_t, std::string> peer_addrs;
@@ -274,18 +274,23 @@ namespace {
 } // namespace
 
 int main(int argc, char **argv) {
-    if(argc != 3) {
-        std::cerr << "Usage: ./tput <MaxClientCount> <PutRatio>\n";
+    if(argc < 3 || argc > 5) {
+        std::cerr << "Usage: ./tput <MaxClientCount> <PutRatio> [NumNodes] [ResultFile]\n";
         return 1;
     }
 
     int max_client_count = 0;
     int put_ratio = 0;
+    uint64_t num_nodes = kDefaultNumNodes;
+    std::string result_path = "result.txt";
     try {
         max_client_count = std::stoi(argv[1]);
         put_ratio = std::stoi(argv[2]);
+
+        if(argc >= 4) { num_nodes = static_cast<uint64_t>(std::stoull(argv[3])); }
+        if(argc >= 5) { result_path = argv[4]; }
     } catch(const std::exception &) {
-        std::cerr << "Both arguments must be integers.\n";
+        std::cerr << "Invalid arguments. MaxClientCount/PutRatio/NumNodes must be numeric.\n";
         return 1;
     }
 
@@ -295,6 +300,10 @@ int main(int argc, char **argv) {
     }
     if(put_ratio < 0 || put_ratio > 100) {
         std::cerr << "PutRatio must be between 0 and 100.\n";
+        return 1;
+    }
+    if(num_nodes < 3) {
+        std::cerr << "NumNodes must be >= 3.\n";
         return 1;
     }
 
@@ -310,11 +319,14 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
-    std::ofstream result_file("result.txt", std::ios::out | std::ios::trunc);
+    std::ofstream result_file(result_path, std::ios::out | std::ios::trunc);
     if(!result_file.is_open()) {
-        std::cerr << "Failed to open result.txt for writing.\n";
+        std::cerr << "Failed to open " << result_path << " for writing.\n";
         return 1;
     }
+
+    std::cout << "Benchmark config: nodes=" << num_nodes << ", putRatio=" << put_ratio
+              << ", maxClients=" << max_client_count << std::endl;
 
     write_result_header(result_file);
     write_result_header(std::cout);
@@ -326,7 +338,7 @@ int main(int argc, char **argv) {
         std::cout << "Running round with " << client_count << " clients..." << std::endl;
 
         std::cout << "  starting cluster..." << std::endl;
-        auto cluster = start_cluster(round_idx, kv_node_bin, logger);
+        auto cluster = start_cluster(round_idx, num_nodes, kv_node_bin, logger);
         std::cout << "  cluster ready, prepopulating keyspace..." << std::endl;
         const bool prepopulate_ok = prepopulate_keyspace(cluster.kv_addrs);
         if(!prepopulate_ok) {
@@ -362,6 +374,6 @@ int main(int argc, char **argv) {
         if(client_count > static_cast<uint64_t>(max_client_count) / 2) { break; }
     }
 
-    std::cout << "Results written to result.txt" << std::endl;
+    std::cout << "Results written to " << result_path << std::endl;
     return saw_any_round_failure ? EXIT_FAILURE : EXIT_SUCCESS;
 }
