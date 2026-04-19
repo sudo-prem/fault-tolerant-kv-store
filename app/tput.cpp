@@ -37,6 +37,7 @@ namespace {
     constexpr uint64_t kPortStridePerRound = 20;
     constexpr std::chrono::seconds kClusterWarmup{ 2 };
     constexpr std::chrono::seconds kPostKillDelay{ 1 };
+    constexpr std::chrono::seconds kProgressPrintInterval{ 5 };
 
     struct LatencyStats {
         double avg_ms = 0.0;
@@ -141,6 +142,10 @@ namespace {
             const std::string value = "init_" + std::to_string(i);
             const auto status = client.put(key, value);
             if(status != kvpb::KV_SUCCESS) { return false; }
+
+            if(i % 200 == 0 || i == kKeyspaceSize) {
+                std::cout << "  prepopulate progress: " << i << "/" << kKeyspaceSize << std::endl;
+            }
         }
         return true;
     }
@@ -155,11 +160,15 @@ namespace {
 
         std::vector<std::vector<double>> per_client_latencies(client_count);
         std::atomic<uint64_t> success_ops{ 0 };
+        std::atomic<uint64_t> completed_clients{ 0 };
 
         std::mutex start_mtx;
         std::condition_variable start_cv;
         uint64_t ready_clients = 0;
         bool start_now = false;
+
+        std::mutex done_mtx;
+        std::condition_variable done_cv;
 
         for(uint64_t c = 0; c < client_count; ++c) {
             workers.emplace_back([&, c] {
@@ -204,6 +213,8 @@ namespace {
                 }
 
                 success_ops.fetch_add(local_success, std::memory_order_relaxed);
+                completed_clients.fetch_add(1, std::memory_order_relaxed);
+                done_cv.notify_all();
             });
         }
 
@@ -215,6 +226,15 @@ namespace {
             start_now = true;
         }
         start_cv.notify_all();
+
+        {
+            std::unique_lock<std::mutex> lk(done_mtx);
+            while(completed_clients.load(std::memory_order_relaxed) < client_count) {
+                done_cv.wait_for(lk, kProgressPrintInterval);
+                const uint64_t done = completed_clients.load(std::memory_order_relaxed);
+                std::cout << "  workload progress: " << done << "/" << client_count << " clients finished" << std::endl;
+            }
+        }
 
         for(auto &worker : workers) {
             if(worker.joinable()) { worker.join(); }
@@ -305,7 +325,9 @@ int main(int argc, char **argv) {
         client_count <<= 1, ++round_idx) {
         std::cout << "Running round with " << client_count << " clients..." << std::endl;
 
+        std::cout << "  starting cluster..." << std::endl;
         auto cluster = start_cluster(round_idx, kv_node_bin, logger);
+        std::cout << "  cluster ready, prepopulating keyspace..." << std::endl;
         const bool prepopulate_ok = prepopulate_keyspace(cluster.kv_addrs);
         if(!prepopulate_ok) {
             std::cerr << "Pre-population failed in round with " << client_count << " clients. Aborting benchmark.\n";
@@ -316,7 +338,10 @@ int main(int argc, char **argv) {
             return 1;
         }
 
+        std::cout << "  prepopulation complete, running workload..." << std::endl;
+
         const RoundResult result = run_round(client_count, put_ratio, cluster.kv_addrs);
+        std::cout << "  workload complete, writing results..." << std::endl;
         write_result_row(result_file, result);
         write_result_row(std::cout, result);
         result_file.flush();
