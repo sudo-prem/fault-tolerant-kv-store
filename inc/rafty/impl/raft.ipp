@@ -68,7 +68,7 @@ namespace rafty {
 
     inline void Raft::kill() {
         dead.store(true);
-        // add your code here if needed.
+        ticker_cv_.notify_all();
     }
 
     inline std::unique_ptr<grpc::ClientContext> Raft::create_context(uint64_t to) const {

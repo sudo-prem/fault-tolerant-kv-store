@@ -4,6 +4,7 @@
 #include <functional>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -43,14 +44,19 @@ namespace rafty {
         // lab3: sync propose
         ProposalResult propose_sync(const std::string &data);
 
+        // lab3: linearizable read helper
+        bool confirm_leadership(std::chrono::milliseconds timeout);
+
         // WARN: do not modify the signature
         void start_server();
         void stop_server();
         void connect_peers();
         bool is_dead() const;
         void kill();
-        grpc::Status handle_append_entries_rpc(const raftpb::AppendEntriesRequest *request, raftpb::AppendEntriesReply *reply);
-        grpc::Status handle_request_vote_rpc(const raftpb::RequestVoteRequest *request, raftpb::RequestVoteReply *reply);
+        grpc::Status
+        handle_append_entries_rpc(const raftpb::AppendEntriesRequest *request, raftpb::AppendEntriesReply *reply);
+        grpc::Status
+        handle_request_vote_rpc(const raftpb::RequestVoteRequest *request, raftpb::RequestVoteReply *reply);
 
     private:
         // WARN: do not modify `create_context` and `apply`.
@@ -64,6 +70,7 @@ namespace rafty {
         // WARN: do not modify `mtx` and `logger`.
         mutable std::mutex mtx;
         std::unique_ptr<rafty::utils::logger> logger;
+
     private:
         enum class Role {
             Follower,
@@ -93,6 +100,7 @@ namespace rafty {
 
         std::atomic<bool> started_{ false };
         std::thread ticker_;
+        std::condition_variable ticker_cv_;
 
         Role role_ = Role::Follower;
         uint64_t current_term_ = 0;

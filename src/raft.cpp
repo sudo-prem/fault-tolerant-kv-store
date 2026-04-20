@@ -60,6 +60,7 @@ namespace rafty {
 
     Raft::~Raft() {
         this->dead.store(true);
+        this->ticker_cv_.notify_all();
         if(this->ticker_.joinable()) { this->ticker_.join(); }
         this->stop_server();
     }
@@ -97,6 +98,7 @@ namespace rafty {
 
         // Kick replication soon, do not wait for commit
         this->next_heartbeat_at_ = std::chrono::steady_clock::now();
+        this->ticker_cv_.notify_one();
 
         result.index = index;
         result.term = term;
@@ -145,6 +147,63 @@ namespace rafty {
             .term = this->current_term_,
             .is_leader = false,
         };
+    }
+
+    bool Raft::confirm_leadership(std::chrono::milliseconds timeout) {
+        std::vector<uint64_t> peers;
+        uint64_t term = 0;
+        {
+            std::lock_guard<std::mutex> lk(this->mtx);
+            if(this->role_ != Role::Leader || this->dead.load()) { return false; }
+            term = this->current_term_;
+            peers.reserve(this->peer_addrs.size());
+            for(const auto &[peer_id, _] : this->peer_addrs) { peers.push_back(peer_id); }
+        }
+
+        uint64_t grants = 1; // self vote
+        const uint64_t quorum = this->quorum_size();
+        if(grants >= quorum) { return true; }
+
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        for(const auto peer_id : peers) {
+            if(grants >= quorum) { break; }
+
+            const auto now = std::chrono::steady_clock::now();
+            if(now >= deadline) { break; }
+
+            auto stub_it = this->peers_.find(peer_id);
+            if(stub_it == this->peers_.end()) { continue; }
+
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+            const auto rpc_timeout = std::min<std::chrono::milliseconds>(remaining, std::chrono::milliseconds(30));
+            if(rpc_timeout <= std::chrono::milliseconds::zero()) { break; }
+
+            raftpb::AppendEntriesRequest req;
+            req.set_term(term);
+            req.set_leader_id(this->id);
+            req.set_prev_log_index(0);
+            req.set_prev_log_term(0);
+            req.set_leader_commit(0);
+
+            raftpb::AppendEntriesReply reply;
+            auto context = this->create_context(peer_id);
+            context->set_deadline(std::chrono::system_clock::now() + rpc_timeout);
+            grpc::Status status = stub_it->second->AppendEntries(&*context, req, &reply);
+            if(!status.ok()) { continue; }
+
+            if(reply.term() > term) {
+                std::lock_guard<std::mutex> lk(this->mtx);
+                if(reply.term() > this->current_term_) { this->become_follower_locked(reply.term()); }
+                return false;
+            }
+
+            if(reply.success()) { grants += 1; }
+        }
+
+        if(grants < quorum) { return false; }
+
+        std::lock_guard<std::mutex> lk(this->mtx);
+        return this->role_ == Role::Leader && this->current_term_ == term && !this->dead.load();
     }
 
     uint64_t Raft::last_log_index_locked() const {
@@ -529,7 +588,8 @@ namespace rafty {
             if(should_send_heartbeat) { this->send_heartbeats_once(); }
             if(should_request_votes) { this->send_request_votes_once(vote_request_term); }
 
-            std::this_thread::sleep_for(kTickerSleepInterval);
+            std::unique_lock<std::mutex> lk(this->mtx);
+            this->ticker_cv_.wait_for(lk, kTickerSleepInterval, [this] { return this->dead.load(); });
         }
     }
 
