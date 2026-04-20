@@ -163,18 +163,18 @@ namespace kv {
                 return grpc::Status::OK;
             }
 
-            if(try_linearizable_fast_get(request->key(), request->client_id(), request->seq_num(), response)) {
-                return grpc::Status::OK;
-            }
-
-            if(!raft_.get_state().is_leader) {
+            const std::string cmd
+                = serialize_op(OpType::Get, request->key(), "", request->client_id(), request->seq_num());
+            auto proposal = raft_.propose(cmd);
+            if(!proposal.is_leader || proposal.index == 0) {
                 response->set_status(kvpb::KV_NOTLEADER);
                 response->set_value("");
                 return grpc::Status::OK;
             }
 
-            response->set_status(kvpb::KV_TIMEOUT);
-            response->set_value("");
+            auto applied = wait_for_apply(proposal.index, cmd);
+            response->set_status(applied.status);
+            response->set_value(applied.value);
             return grpc::Status::OK;
         }
 
@@ -335,37 +335,12 @@ namespace kv {
             };
         }
 
-        bool try_linearizable_fast_get(const std::string &key, uint64_t client_id, uint64_t seq_num,
-                                       kvpb::GetResponse *response) {
-            if(!raft_.confirm_leadership(kReadConfirmTimeout)) { return false; }
-
-            std::lock_guard<std::mutex> lk(mu_);
-            auto it = store_.find(key);
-            const std::string value = (it == store_.end()) ? "" : it->second;
-
-            auto &history = dedup_[client_id];
-            history.by_seq[seq_num] = ClientCache{
-                .status = kvpb::KV_SUCCESS,
-                .value = value,
-            };
-            if(seq_num > history.max_seq) { history.max_seq = seq_num; }
-
-            response->set_status(kvpb::KV_SUCCESS);
-            response->set_value(value);
-            return true;
-        }
-
         std::optional<ClientCache> check_cached_duplicate(uint64_t client_id, uint64_t seq_num) {
             std::lock_guard<std::mutex> lk(mu_);
             auto it = dedup_.find(client_id);
             if(it != dedup_.end()) {
                 auto cached_it = it->second.by_seq.find(seq_num);
                 if(cached_it != it->second.by_seq.end()) { return cached_it->second; }
-
-                if(seq_num < it->second.max_seq) {
-                    auto latest_it = it->second.by_seq.find(it->second.max_seq);
-                    if(latest_it != it->second.by_seq.end()) { return latest_it->second; }
-                }
             }
             return std::nullopt;
         }
@@ -425,7 +400,6 @@ namespace kv {
         std::deque<uint64_t> applied_order_;
 
         static constexpr std::chrono::milliseconds kRpcWaitTimeout{ 4500 };
-        static constexpr std::chrono::milliseconds kReadConfirmTimeout{ 35 };
         static constexpr size_t kAppliedHistoryLimit = 2048;
     };
 
