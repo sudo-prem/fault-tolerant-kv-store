@@ -206,6 +206,30 @@ namespace rafty {
         return this->role_ == Role::Leader && this->current_term_ == term && !this->dead.load();
     }
 
+    bool Raft::has_committed_current_term_entry() const {
+        std::lock_guard<std::mutex> lk(this->mtx);
+        return this->role_ == Role::Leader && !this->dead.load() && this->commit_index_ > 0
+               && this->commit_index_ < this->log_.size()
+               && this->log_[this->commit_index_].term == this->current_term_;
+    }
+
+    std::optional<uint64_t> Raft::linearizable_read_index(std::chrono::milliseconds timeout) {
+        {
+            std::lock_guard<std::mutex> lk(this->mtx);
+            if(this->role_ != Role::Leader || this->dead.load()) { return std::nullopt; }
+            if(this->commit_index_ == 0 || this->commit_index_ >= this->log_.size()) { return std::nullopt; }
+            if(this->log_[this->commit_index_].term != this->current_term_) { return std::nullopt; }
+        }
+
+        if(!this->confirm_leadership(timeout)) { return std::nullopt; }
+
+        std::lock_guard<std::mutex> lk(this->mtx);
+        if(this->role_ != Role::Leader || this->dead.load()) { return std::nullopt; }
+        if(this->commit_index_ == 0 || this->commit_index_ >= this->log_.size()) { return std::nullopt; }
+        if(this->log_[this->commit_index_].term != this->current_term_) { return std::nullopt; }
+        return this->commit_index_;
+    }
+
     uint64_t Raft::last_log_index_locked() const {
         if(this->log_.empty()) { return 0; }
         return this->log_.back().index;

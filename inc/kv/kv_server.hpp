@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -7,7 +8,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <sstream>
 #include <string>
 #include <unordered_map>
 
@@ -40,8 +40,10 @@ namespace kv {
                         pending_to_notify->matched = false;
                         pending_by_index_.erase(it);
                     }
+                    last_applied_index_ = std::max(last_applied_index_, result.index);
                 }
                 if(pending_to_notify) { pending_to_notify->cv.notify_one(); }
+                apply_progress_cv_.notify_all();
                 return;
             }
 
@@ -63,16 +65,6 @@ namespace kv {
                     }
                 }
 
-                if(!is_dup && dedup_it != dedup_.end() && op->seq_num < dedup_it->second.max_seq) {
-                    // Old/superseded request: do not re-execute an already-seen sequence.
-                    is_dup = true;
-                    auto latest_it = dedup_it->second.by_seq.find(dedup_it->second.max_seq);
-                    if(latest_it != dedup_it->second.by_seq.end()) {
-                        status = latest_it->second.status;
-                        value = latest_it->second.value;
-                    }
-                }
-
                 if(!is_dup) {
                     if(op->type == OpType::Put) {
                         store_[op->key] = op->value;
@@ -83,12 +75,7 @@ namespace kv {
                         value = (it == store_.end()) ? "" : it->second;
                     }
 
-                    auto &history = dedup_[op->client_id];
-                    history.by_seq[op->seq_num] = ClientCache{
-                        .status = status,
-                        .value = value,
-                    };
-                    if(op->seq_num > history.max_seq) { history.max_seq = op->seq_num; }
+                    cache_client_result_locked(op->client_id, op->seq_num, status, value);
                 }
 
                 // Record applied results so waiters arriving after apply still resolve.
@@ -104,6 +91,8 @@ namespace kv {
                     applied_by_index_.erase(old_index);
                 }
 
+                last_applied_index_ = std::max(last_applied_index_, result.index);
+
                 auto pending_it = pending_by_index_.find(result.index);
                 if(pending_it != pending_by_index_.end()) {
                     pending_to_notify = pending_it->second;
@@ -116,20 +105,21 @@ namespace kv {
             }
 
             if(pending_to_notify) { pending_to_notify->cv.notify_one(); }
+            apply_progress_cv_.notify_all();
         }
 
         grpc::Status
         Put(grpc::ServerContext *context, const kvpb::PutRequest *request, kvpb::KvResponse *response) override {
             (void)context;
 
-            if(!raft_.get_state().is_leader) {
-                response->set_status(kvpb::KV_NOTLEADER);
-                return grpc::Status::OK;
-            }
-
             auto cached = check_cached_duplicate(request->client_id(), request->seq_num());
             if(cached.has_value()) {
                 response->set_status(cached->status);
+                return grpc::Status::OK;
+            }
+
+            if(!raft_.get_state().is_leader) {
+                response->set_status(kvpb::KV_NOTLEADER);
                 return grpc::Status::OK;
             }
 
@@ -150,16 +140,23 @@ namespace kv {
         Get(grpc::ServerContext *context, const kvpb::GetRequest *request, kvpb::GetResponse *response) override {
             (void)context;
 
+            auto cached = check_cached_duplicate(request->client_id(), request->seq_num());
+            if(cached.has_value()) {
+                response->set_status(cached->status);
+                response->set_value(cached->value);
+                return grpc::Status::OK;
+            }
+
             if(!raft_.get_state().is_leader) {
                 response->set_status(kvpb::KV_NOTLEADER);
                 response->set_value("");
                 return grpc::Status::OK;
             }
 
-            auto cached = check_cached_duplicate(request->client_id(), request->seq_num());
-            if(cached.has_value()) {
-                response->set_status(cached->status);
-                response->set_value(cached->value);
+            auto fast_read = try_linearizable_local_get(request->key(), request->client_id(), request->seq_num());
+            if(fast_read.has_value()) {
+                response->set_status(fast_read->status);
+                response->set_value(fast_read->value);
                 return grpc::Status::OK;
             }
 
@@ -182,14 +179,14 @@ namespace kv {
         Append(grpc::ServerContext *context, const kvpb::AppendRequest *request, kvpb::KvResponse *response) override {
             (void)context;
 
-            if(!raft_.get_state().is_leader) {
-                response->set_status(kvpb::KV_NOTLEADER);
-                return grpc::Status::OK;
-            }
-
             auto cached = check_cached_duplicate(request->client_id(), request->seq_num());
             if(cached.has_value()) {
                 response->set_status(cached->status);
+                return grpc::Status::OK;
+            }
+
+            if(!raft_.get_state().is_leader) {
+                response->set_status(kvpb::KV_NOTLEADER);
                 return grpc::Status::OK;
             }
 
@@ -223,7 +220,6 @@ namespace kv {
         };
 
         struct ClientHistory {
-            uint64_t max_seq = 0;
             std::unordered_map<uint64_t, ClientCache> by_seq;
         };
 
@@ -247,44 +243,43 @@ namespace kv {
             std::string value;
         };
 
+        static void append_u64(std::string &out, uint64_t value) {
+            for(int shift = 56; shift >= 0; shift -= 8) { out.push_back(static_cast<char>((value >> shift) & 0xff)); }
+        }
+
+        static bool read_u64(const std::string &data, size_t &pos, uint64_t &value) {
+            if(pos + sizeof(uint64_t) > data.size()) { return false; }
+
+            value = 0;
+            for(size_t i = 0; i < sizeof(uint64_t); ++i) {
+                value = (value << 8) | static_cast<unsigned char>(data[pos]);
+                ++pos;
+            }
+            return true;
+        }
+
         static std::string serialize_op(OpType type, const std::string &key, const std::string &value,
                                         uint64_t client_id, uint64_t seq_num) {
-            // Format:
-            // <type>\n<client_id>\n<seq_num>\n<key_len>\n<value_len>\n<key><value>
             std::string out;
-            out.reserve(64 + key.size() + value.size());
-            out.append(std::to_string(static_cast<uint8_t>(type)));
-            out.push_back('\n');
-            out.append(std::to_string(client_id));
-            out.push_back('\n');
-            out.append(std::to_string(seq_num));
-            out.push_back('\n');
-            out.append(std::to_string(key.size()));
-            out.push_back('\n');
-            out.append(std::to_string(value.size()));
-            out.push_back('\n');
+            out.reserve(1 + (sizeof(uint64_t) * 4) + key.size() + value.size());
+            out.push_back(static_cast<char>(type));
+            append_u64(out, client_id);
+            append_u64(out, seq_num);
+            append_u64(out, key.size());
+            append_u64(out, value.size());
             out.append(key);
             out.append(value);
             return out;
         }
 
         static std::optional<Op> deserialize_op(const std::string &data) {
-            size_t pos = 0;
-            const auto parse_line = [&](size_t &cursor, std::string &line) -> bool {
-                const size_t nl = data.find('\n', cursor);
-                if(nl == std::string::npos) { return false; }
-                line = data.substr(cursor, nl - cursor);
-                cursor = nl + 1;
-                return true;
-            };
+            constexpr size_t kHeaderSize = 1 + (sizeof(uint64_t) * 4);
+            if(data.size() < kHeaderSize) { return std::nullopt; }
 
-            std::string line;
-            if(!parse_line(pos, line)) { return std::nullopt; }
-            int raw_type = -1;
-            {
-                std::istringstream iss(line);
-                if(!(iss >> raw_type)) { return std::nullopt; }
-            }
+            size_t pos = 0;
+            const uint8_t raw_type = static_cast<uint8_t>(data[pos]);
+            ++pos;
+
             OpType type;
             if(raw_type == 0) {
                 type = OpType::Put;
@@ -296,42 +291,41 @@ namespace kv {
                 return std::nullopt;
             }
 
-            if(!parse_line(pos, line)) { return std::nullopt; }
             uint64_t client_id = 0;
-            {
-                std::istringstream iss(line);
-                if(!(iss >> client_id)) { return std::nullopt; }
-            }
+            if(!read_u64(data, pos, client_id)) { return std::nullopt; }
 
-            if(!parse_line(pos, line)) { return std::nullopt; }
             uint64_t seq_num = 0;
-            {
-                std::istringstream iss(line);
-                if(!(iss >> seq_num)) { return std::nullopt; }
-            }
+            if(!read_u64(data, pos, seq_num)) { return std::nullopt; }
 
-            if(!parse_line(pos, line)) { return std::nullopt; }
-            size_t key_len = 0;
-            {
-                std::istringstream iss(line);
-                if(!(iss >> key_len)) { return std::nullopt; }
-            }
+            uint64_t key_len = 0;
+            if(!read_u64(data, pos, key_len)) { return std::nullopt; }
 
-            if(!parse_line(pos, line)) { return std::nullopt; }
-            size_t value_len = 0;
-            {
-                std::istringstream iss(line);
-                if(!(iss >> value_len)) { return std::nullopt; }
-            }
+            uint64_t value_len = 0;
+            if(!read_u64(data, pos, value_len)) { return std::nullopt; }
 
-            if(pos + key_len + value_len > data.size()) { return std::nullopt; }
+            if(key_len > data.size() - pos) { return std::nullopt; }
+            pos += static_cast<size_t>(key_len);
+            if(value_len > data.size() - pos) { return std::nullopt; }
+
+            const size_t key_pos = pos - static_cast<size_t>(key_len);
+            const size_t value_pos = pos;
+            if(value_pos + static_cast<size_t>(value_len) != data.size()) { return std::nullopt; }
 
             return Op{
                 .type = type,
                 .client_id = client_id,
                 .seq_num = seq_num,
-                .key = data.substr(pos, key_len),
-                .value = data.substr(pos + key_len, value_len),
+                .key = data.substr(key_pos, static_cast<size_t>(key_len)),
+                .value = data.substr(value_pos, static_cast<size_t>(value_len)),
+            };
+        }
+
+        void cache_client_result_locked(uint64_t client_id, uint64_t seq_num, kvpb::KvStatus status,
+                                        const std::string &value) {
+            auto &history = dedup_[client_id];
+            history.by_seq[seq_num] = ClientCache{
+                .status = status,
+                .value = value,
             };
         }
 
@@ -343,6 +337,36 @@ namespace kv {
                 if(cached_it != it->second.by_seq.end()) { return cached_it->second; }
             }
             return std::nullopt;
+        }
+
+        bool wait_until_applied(uint64_t index, std::unique_lock<std::mutex> &lk,
+                                std::chrono::steady_clock::time_point deadline) {
+            while(last_applied_index_ < index) {
+                if(apply_progress_cv_.wait_until(lk, deadline) == std::cv_status::timeout) { return false; }
+            }
+            return true;
+        }
+
+        std::optional<ApplyOutcome>
+        try_linearizable_local_get(const std::string &key, uint64_t client_id, uint64_t seq_num) {
+            if(!raft_.has_committed_current_term_entry()) { return std::nullopt; }
+
+            auto read_index = raft_.linearizable_read_index(kReadConfirmTimeout);
+            if(!read_index.has_value()) {
+                if(!raft_.get_state().is_leader) { return ApplyOutcome{ .status = kvpb::KV_NOTLEADER, .value = "" }; }
+                return std::nullopt;
+            }
+
+            std::unique_lock<std::mutex> lk(mu_);
+            const auto deadline = std::chrono::steady_clock::now() + kRpcWaitTimeout;
+            if(!wait_until_applied(*read_index, lk, deadline)) {
+                return ApplyOutcome{ .status = kvpb::KV_TIMEOUT, .value = "" };
+            }
+
+            const auto it = store_.find(key);
+            const std::string value = (it == store_.end()) ? "" : it->second;
+            cache_client_result_locked(client_id, seq_num, kvpb::KV_SUCCESS, value);
+            return ApplyOutcome{ .status = kvpb::KV_SUCCESS, .value = value };
         }
 
         ApplyOutcome wait_for_apply(uint64_t index, const std::string &command) {
@@ -398,8 +422,11 @@ namespace kv {
         std::unordered_map<uint64_t, std::shared_ptr<Pending>> pending_by_index_;
         std::unordered_map<uint64_t, AppliedEntry> applied_by_index_;
         std::deque<uint64_t> applied_order_;
+        uint64_t last_applied_index_ = 0;
+        std::condition_variable apply_progress_cv_;
 
         static constexpr std::chrono::milliseconds kRpcWaitTimeout{ 4500 };
+        static constexpr std::chrono::milliseconds kReadConfirmTimeout{ 100 };
         static constexpr size_t kAppliedHistoryLimit = 2048;
     };
 

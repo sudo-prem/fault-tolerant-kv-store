@@ -46,6 +46,8 @@ namespace rafty {
 
         // lab3: linearizable read helper
         bool confirm_leadership(std::chrono::milliseconds timeout);
+        bool has_committed_current_term_entry() const;
+        std::optional<uint64_t> linearizable_read_index(std::chrono::milliseconds timeout);
 
         // WARN: do not modify the signature
         void start_server();
