@@ -54,7 +54,7 @@ namespace rafty {
         this->next_index_.clear();
         this->match_index_.clear();
         this->last_append_success_at_.clear();
-        this->replication_requested_ = false;
+        this->replication_epoch_ = 0;
 
         this->next_heartbeat_at_ = std::chrono::steady_clock::now() + this->heartbeat_interval_;
         this->reset_election_deadline_locked();
@@ -63,7 +63,11 @@ namespace rafty {
     Raft::~Raft() {
         this->dead.store(true);
         this->ticker_cv_.notify_all();
+        this->replication_cv_.notify_all();
         if(this->ticker_.joinable()) { this->ticker_.join(); }
+        for(auto &worker : this->replication_workers_) {
+            if(worker.joinable()) { worker.join(); }
+        }
         this->stop_server();
     }
 
@@ -72,6 +76,10 @@ namespace rafty {
         if(this->started_.exchange(true)) { return; }
 
         logger->info("Raft node {} starting main loop", this->id);
+        this->replication_workers_.reserve(this->peer_addrs.size());
+        for(const auto &[peer_id, _] : this->peer_addrs) {
+            this->replication_workers_.emplace_back([this, peer_id] { this->replication_loop(peer_id); });
+        }
         this->ticker_ = std::thread([this] { this->ticker_loop(); });
     }
 
@@ -98,10 +106,7 @@ namespace rafty {
         const uint64_t term = this->current_term_;
         this->log_.push_back(LogEntry{ .index = index, .term = term, .data = data });
 
-        // Kick replication immediately instead of waiting for the next timer tick.
-        this->replication_requested_ = true;
-        this->next_heartbeat_at_ = std::chrono::steady_clock::now();
-        this->ticker_cv_.notify_one();
+        this->notify_replication_locked();
 
         result.index = index;
         result.term = term;
@@ -271,6 +276,11 @@ namespace rafty {
         return false;
     }
 
+    void Raft::notify_replication_locked() {
+        this->replication_epoch_ += 1;
+        this->replication_cv_.notify_all();
+    }
+
     raftpb::Entry Raft::to_proto_entry(const LogEntry &e) const {
         raftpb::Entry out;
         out.set_index(e.index);
@@ -329,15 +339,13 @@ namespace rafty {
         this->role_ = Role::Follower;
         this->current_term_ = std::max(this->current_term_, new_term);
         this->voted_for_.reset();
-        this->replication_requested_ = false;
         this->last_append_success_at_.clear();
         this->reset_election_deadline_locked();
     }
 
     void Raft::become_leader_locked() {
         this->role_ = Role::Leader;
-        this->next_heartbeat_at_ = std::chrono::steady_clock::now();
-        this->replication_requested_ = true;
+        this->next_heartbeat_at_ = std::chrono::steady_clock::now() + this->heartbeat_interval_;
 
         this->next_index_.clear();
         this->match_index_.clear();
@@ -348,6 +356,8 @@ namespace rafty {
             this->match_index_[peer_id] = 0;
         }
 
+        this->notify_replication_locked();
+
         logger->info("Node {} became leader at term {}", this->id, this->current_term_);
     }
 
@@ -356,7 +366,6 @@ namespace rafty {
         this->current_term_ += 1;
         this->voted_for_ = this->id;
         this->votes_granted_in_term_ = 1;
-        this->replication_requested_ = false;
         this->last_append_success_at_.clear();
         this->reset_election_deadline_locked();
         logger->info("Node {} started election for term {}", this->id, this->current_term_);
@@ -510,122 +519,135 @@ namespace rafty {
         }
     }
 
-    void Raft::send_heartbeats_once() {
+    void Raft::replication_loop(uint64_t peer_id) {
         struct AppendPlan {
-            uint64_t peer_id;
-            uint64_t term;
-            uint64_t leader_commit;
-            uint64_t prev_log_index;
-            uint64_t prev_log_term;
+            raftpb::RaftService::Stub *stub = nullptr;
+            uint64_t term = 0;
+            uint64_t leader_commit = 0;
+            uint64_t prev_log_index = 0;
+            uint64_t prev_log_term = 0;
             std::vector<LogEntry> entries;
         };
 
-        constexpr size_t kMaxEntriesPerAppend = 16; // faster catch-up while keeping RPC size bounded
+        constexpr size_t kMaxEntriesPerAppend = 64;
 
-        for(const auto &[peer_id, _] : this->peer_addrs) {
+        raftpb::RaftService::Stub *stub = nullptr;
+        {
             auto stub_it = this->peers_.find(peer_id);
-            if(stub_it == this->peers_.end()) { continue; }
+            if(stub_it == this->peers_.end()) { return; }
+            stub = stub_it->second.get();
+        }
 
-            AppendPlan plan;
+        uint64_t seen_epoch = 0;
+        while(!this->dead.load()) {
             {
-                std::lock_guard<std::mutex> lk(this->mtx);
-                if(this->role_ != Role::Leader || this->dead.load()) { return; }
+                std::unique_lock<std::mutex> lk(this->mtx);
+                this->replication_cv_.wait(lk, [&] {
+                    return this->dead.load() || (this->role_ == Role::Leader && this->replication_epoch_ != seen_epoch);
+                });
+                if(this->dead.load()) { return; }
+                seen_epoch = this->replication_epoch_;
+            }
 
-                const uint64_t last_index = this->last_log_index_locked();
-                auto it = this->next_index_.find(peer_id);
-                uint64_t next_index = (it == this->next_index_.end()) ? (last_index + 1) : it->second;
+            while(!this->dead.load()) {
+                AppendPlan plan;
+                {
+                    std::lock_guard<std::mutex> lk(this->mtx);
+                    if(this->role_ != Role::Leader || this->dead.load()) { break; }
 
-                // Clamp next_index to a valid range
-                if(next_index < 1) { next_index = 1; }
-                if(next_index > last_index + 1) { next_index = last_index + 1; }
+                    const uint64_t last_index = this->last_log_index_locked();
+                    auto it = this->next_index_.find(peer_id);
+                    uint64_t next_index = (it == this->next_index_.end()) ? (last_index + 1) : it->second;
+                    if(next_index < 1) { next_index = 1; }
+                    if(next_index > last_index + 1) { next_index = last_index + 1; }
 
-                const uint64_t prev_index = next_index - 1;
-                const uint64_t prev_term = (prev_index < this->log_.size()) ? this->log_[prev_index].term : 0;
+                    const uint64_t prev_index = next_index - 1;
+                    const uint64_t prev_term = (prev_index < this->log_.size()) ? this->log_[prev_index].term : 0;
 
-                plan.peer_id = peer_id;
-                plan.term = this->current_term_;
-                plan.leader_commit = this->commit_index_;
-                plan.prev_log_index = prev_index;
-                plan.prev_log_term = prev_term;
+                    plan.stub = stub;
+                    plan.term = this->current_term_;
+                    plan.leader_commit = this->commit_index_;
+                    plan.prev_log_index = prev_index;
+                    plan.prev_log_term = prev_term;
 
-                if(next_index <= last_index) {
-                    const uint64_t end
-                        = std::min<uint64_t>(last_index, next_index + static_cast<uint64_t>(kMaxEntriesPerAppend) - 1);
-                    plan.entries.reserve(static_cast<size_t>(end - next_index + 1));
-                    for(uint64_t idx = next_index; idx <= end; idx++) {
-                        if(idx < this->log_.size()) { plan.entries.push_back(this->log_[idx]); }
+                    if(next_index <= last_index) {
+                        const uint64_t end = std::min<uint64_t>(
+                            last_index, next_index + static_cast<uint64_t>(kMaxEntriesPerAppend) - 1);
+                        plan.entries.reserve(static_cast<size_t>(end - next_index + 1));
+                        for(uint64_t idx = next_index; idx <= end; ++idx) {
+                            if(idx < this->log_.size()) { plan.entries.push_back(this->log_[idx]); }
+                        }
                     }
                 }
-            }
 
-            raftpb::AppendEntriesRequest req;
-            req.set_term(plan.term);
-            req.set_leader_id(this->id);
-            req.set_prev_log_index(plan.prev_log_index);
-            req.set_prev_log_term(plan.prev_log_term);
-            req.set_leader_commit(plan.leader_commit);
-            for(const auto &e : plan.entries) { *req.add_entries() = this->to_proto_entry(e); }
+                raftpb::AppendEntriesRequest req;
+                req.set_term(plan.term);
+                req.set_leader_id(this->id);
+                req.set_prev_log_index(plan.prev_log_index);
+                req.set_prev_log_term(plan.prev_log_term);
+                req.set_leader_commit(plan.leader_commit);
+                for(const auto &entry : plan.entries) { *req.add_entries() = this->to_proto_entry(entry); }
 
-            raftpb::AppendEntriesReply reply;
-            auto context = this->create_context(peer_id);
-            context->set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(200));
-            grpc::Status status = stub_it->second->AppendEntries(&*context, req, &reply);
-            if(!status.ok()) { continue; }
+                raftpb::AppendEntriesReply reply;
+                auto context = this->create_context(peer_id);
+                context->set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(200));
+                grpc::Status status = plan.stub->AppendEntries(&*context, req, &reply);
 
-            if(reply.term() > plan.term) {
-                std::lock_guard<std::mutex> lk(this->mtx);
-                if(reply.term() > this->current_term_) {
-                    logger->info("Node {} stepping down due to higher term {}", this->id, reply.term());
-                    this->become_follower_locked(reply.term());
+                std::vector<ApplyResult> applies;
+                bool retry_now = false;
+                {
+                    std::lock_guard<std::mutex> lk(this->mtx);
+                    if(this->dead.load()) { return; }
+
+                    if(status.ok() && reply.term() > plan.term) {
+                        if(reply.term() > this->current_term_) { this->become_follower_locked(reply.term()); }
+                        break;
+                    }
+
+                    if(this->role_ != Role::Leader || this->current_term_ != plan.term) { break; }
+
+                    if(!status.ok()) { break; }
+
+                    if(!reply.success()) {
+                        const uint64_t cur = this->next_index_.contains(peer_id) ? this->next_index_[peer_id]
+                                                                                 : (plan.prev_log_index + 1);
+                        const uint64_t step = std::max<uint64_t>(1, (cur - 1) / 2);
+                        this->next_index_[peer_id] = std::max<uint64_t>(1, cur - step);
+                        retry_now = true;
+                    } else {
+                        this->last_append_success_at_[peer_id] = std::chrono::steady_clock::now();
+
+                        const uint64_t advanced = plan.prev_log_index + static_cast<uint64_t>(plan.entries.size());
+                        auto cur_match = this->match_index_.find(peer_id);
+                        uint64_t prev_match = (cur_match == this->match_index_.end()) ? 0 : cur_match->second;
+                        const uint64_t new_match = std::max(prev_match, advanced);
+                        this->match_index_[peer_id] = new_match;
+                        this->next_index_[peer_id] = new_match + 1;
+
+                        const uint64_t candidate = this->majority_match_index_locked();
+                        if(candidate > this->commit_index_ && candidate < this->log_.size()
+                           && this->log_[candidate].term == this->current_term_) {
+                            this->commit_index_ = candidate;
+                            this->notify_replication_locked();
+                        }
+
+                        applies = this->collect_newly_committed_applies_locked();
+
+                        const uint64_t last_index = this->last_log_index_locked();
+                        retry_now = this->next_index_[peer_id] <= last_index || this->commit_index_ > plan.leader_commit
+                                    || this->replication_epoch_ != seen_epoch;
+                        seen_epoch = this->replication_epoch_;
+                    }
                 }
-                continue;
+
+                for(const auto &apply_result : applies) { this->apply(apply_result); }
+                if(!retry_now) { break; }
             }
-
-            if(!reply.success()) {
-                std::lock_guard<std::mutex> lk(this->mtx);
-                if(this->role_ == Role::Leader && this->current_term_ == plan.term) {
-                    // Back up nextIndex aggressively to reduce retry rounds on diverged logs.
-                    const uint64_t cur
-                        = this->next_index_.contains(peer_id) ? this->next_index_[peer_id] : (plan.prev_log_index + 1);
-                    const uint64_t step = std::max<uint64_t>(1, (cur - 1) / 2);
-                    this->next_index_[peer_id] = std::max<uint64_t>(1, cur - step);
-                }
-                continue;
-            }
-
-            std::vector<ApplyResult> applies;
-            {
-                std::lock_guard<std::mutex> lk(this->mtx);
-                if(this->role_ != Role::Leader || this->current_term_ != plan.term) { continue; }
-
-                this->last_append_success_at_[peer_id] = std::chrono::steady_clock::now();
-
-                // Update follower progress - works for both empty and non-empty appends
-                const uint64_t advanced = plan.prev_log_index + static_cast<uint64_t>(plan.entries.size());
-                auto cur_match = this->match_index_.find(peer_id);
-                uint64_t prev_match = (cur_match == this->match_index_.end()) ? 0 : cur_match->second;
-                const uint64_t new_match = std::max(prev_match, advanced);
-                this->match_index_[peer_id] = new_match;
-                this->next_index_[peer_id] = new_match + 1;
-
-                // Leader commit rule: commit N if a majority have replicated it and log[N].term == currentTerm
-                const uint64_t candidate = this->majority_match_index_locked();
-                if(candidate > this->commit_index_ && candidate < this->log_.size()
-                   && this->log_[candidate].term == this->current_term_) {
-                    this->commit_index_ = candidate;
-                    // Propagate updated leaderCommit promptly
-                    this->next_heartbeat_at_ = std::chrono::steady_clock::now();
-                }
-
-                applies = this->collect_newly_committed_applies_locked();
-            }
-            for(const auto &a : applies) { this->apply(a); }
         }
     }
 
     void Raft::ticker_loop() {
         while(!this->dead.load()) {
-            bool should_send_heartbeat = false;
             bool should_request_votes = false;
             uint64_t vote_request_term = 0;
             {
@@ -633,10 +655,9 @@ namespace rafty {
                 const auto now = std::chrono::steady_clock::now();
 
                 if(this->role_ == Role::Leader) {
-                    if(this->replication_requested_ || now >= this->next_heartbeat_at_) {
-                        should_send_heartbeat = true;
-                        this->replication_requested_ = false;
+                    if(now >= this->next_heartbeat_at_) {
                         this->next_heartbeat_at_ = now + this->heartbeat_interval_;
+                        this->notify_replication_locked();
                     }
                 } else if(now >= this->election_deadline_) {
                     this->start_election_locked();
@@ -650,7 +671,6 @@ namespace rafty {
                 }
             }
 
-            if(should_send_heartbeat) { this->send_heartbeats_once(); }
             if(should_request_votes) { this->send_request_votes_once(vote_request_term); }
 
             std::unique_lock<std::mutex> lk(this->mtx);
@@ -660,8 +680,7 @@ namespace rafty {
             if(wake_at <= std::chrono::steady_clock::now()) { continue; }
 
             this->ticker_cv_.wait_until(lk, wake_at, [this] {
-                return this->dead.load() || this->replication_requested_
-                       || (this->election_needs_vote_requests_ && this->role_ == Role::Candidate);
+                return this->dead.load() || (this->election_needs_vote_requests_ && this->role_ == Role::Candidate);
             });
         }
     }

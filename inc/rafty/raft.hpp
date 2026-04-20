@@ -103,6 +103,8 @@ namespace rafty {
         std::atomic<bool> started_{ false };
         std::thread ticker_;
         std::condition_variable ticker_cv_;
+        std::condition_variable replication_cv_;
+        std::vector<std::thread> replication_workers_;
 
         Role role_ = Role::Follower;
         uint64_t current_term_ = 0;
@@ -128,7 +130,7 @@ namespace rafty {
         uint64_t votes_granted_in_term_ = 0;
         bool election_needs_vote_requests_ = false;
         uint64_t pending_vote_request_term_ = 0;
-        bool replication_requested_ = false;
+        uint64_t replication_epoch_ = 0;
 
         uint64_t last_log_index_locked() const;
         uint64_t last_log_term_locked() const;
@@ -137,6 +139,8 @@ namespace rafty {
         std::vector<ApplyResult> collect_newly_committed_applies_locked();
         bool has_quorum_recent_contact_locked(std::chrono::steady_clock::time_point now,
                                               std::chrono::milliseconds lease_duration) const;
+        void notify_replication_locked();
+        void replication_loop(uint64_t peer_id);
 
         std::chrono::milliseconds random_election_timeout() const;
         uint64_t quorum_size() const;
@@ -145,7 +149,6 @@ namespace rafty {
         void become_leader_locked();
         void become_follower_locked(uint64_t new_term);
         void send_request_votes_once(uint64_t term);
-        void send_heartbeats_once();
         void ticker_loop();
     };
 } // namespace rafty
