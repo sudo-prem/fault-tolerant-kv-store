@@ -117,6 +117,7 @@ namespace rafty {
         // Leader state (reinitialized after election)
         std::unordered_map<uint64_t, uint64_t> next_index_;
         std::unordered_map<uint64_t, uint64_t> match_index_;
+        std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> last_append_success_at_;
 
         std::chrono::milliseconds heartbeat_interval_{ 120 };
         std::chrono::milliseconds election_timeout_min_{ 450 };
@@ -127,12 +128,15 @@ namespace rafty {
         uint64_t votes_granted_in_term_ = 0;
         bool election_needs_vote_requests_ = false;
         uint64_t pending_vote_request_term_ = 0;
+        bool replication_requested_ = false;
 
         uint64_t last_log_index_locked() const;
         uint64_t last_log_term_locked() const;
         raftpb::Entry to_proto_entry(const LogEntry &e) const;
         uint64_t majority_match_index_locked() const;
         std::vector<ApplyResult> collect_newly_committed_applies_locked();
+        bool has_quorum_recent_contact_locked(std::chrono::steady_clock::time_point now,
+                                              std::chrono::milliseconds lease_duration) const;
 
         std::chrono::milliseconds random_election_timeout() const;
         uint64_t quorum_size() const;

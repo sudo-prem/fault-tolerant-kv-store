@@ -15,7 +15,7 @@ namespace rafty {
     using grpc::experimental::CreateCustomChannelWithInterceptors;
 
     namespace {
-        const std::chrono::milliseconds kTickerSleepInterval{ 4 };
+        const std::chrono::milliseconds kReadLeaseDuration{ 180 };
     }
 
     namespace {
@@ -53,6 +53,8 @@ namespace rafty {
         this->last_applied_ = 0;
         this->next_index_.clear();
         this->match_index_.clear();
+        this->last_append_success_at_.clear();
+        this->replication_requested_ = false;
 
         this->next_heartbeat_at_ = std::chrono::steady_clock::now() + this->heartbeat_interval_;
         this->reset_election_deadline_locked();
@@ -96,7 +98,8 @@ namespace rafty {
         const uint64_t term = this->current_term_;
         this->log_.push_back(LogEntry{ .index = index, .term = term, .data = data });
 
-        // Kick replication soon, do not wait for commit
+        // Kick replication immediately instead of waiting for the next timer tick.
+        this->replication_requested_ = true;
         this->next_heartbeat_at_ = std::chrono::steady_clock::now();
         this->ticker_cv_.notify_one();
 
@@ -151,6 +154,7 @@ namespace rafty {
 
     bool Raft::confirm_leadership(std::chrono::milliseconds timeout) {
         std::vector<uint64_t> peers;
+        std::vector<uint64_t> successful_contacts;
         uint64_t term = 0;
         {
             std::lock_guard<std::mutex> lk(this->mtx);
@@ -197,13 +201,20 @@ namespace rafty {
                 return false;
             }
 
-            if(reply.success()) { grants += 1; }
+            if(reply.success()) {
+                grants += 1;
+                successful_contacts.push_back(peer_id);
+            }
         }
 
         if(grants < quorum) { return false; }
 
         std::lock_guard<std::mutex> lk(this->mtx);
-        return this->role_ == Role::Leader && this->current_term_ == term && !this->dead.load();
+        if(this->role_ != Role::Leader || this->current_term_ != term || this->dead.load()) { return false; }
+
+        const auto now = std::chrono::steady_clock::now();
+        for(const auto peer_id : successful_contacts) { this->last_append_success_at_[peer_id] = now; }
+        return true;
     }
 
     bool Raft::has_committed_current_term_entry() const {
@@ -219,6 +230,9 @@ namespace rafty {
             if(this->role_ != Role::Leader || this->dead.load()) { return std::nullopt; }
             if(this->commit_index_ == 0 || this->commit_index_ >= this->log_.size()) { return std::nullopt; }
             if(this->log_[this->commit_index_].term != this->current_term_) { return std::nullopt; }
+            if(this->has_quorum_recent_contact_locked(std::chrono::steady_clock::now(), kReadLeaseDuration)) {
+                return this->commit_index_;
+            }
         }
 
         if(!this->confirm_leadership(timeout)) { return std::nullopt; }
@@ -238,6 +252,23 @@ namespace rafty {
     uint64_t Raft::last_log_term_locked() const {
         if(this->log_.empty()) { return 0; }
         return this->log_.back().term;
+    }
+
+    bool Raft::has_quorum_recent_contact_locked(std::chrono::steady_clock::time_point now,
+                                                std::chrono::milliseconds lease_duration) const {
+        uint64_t grants = 1; // leader itself
+        const uint64_t quorum = this->quorum_size();
+        if(grants >= quorum) { return true; }
+
+        for(const auto &[peer_id, _] : this->peer_addrs) {
+            auto it = this->last_append_success_at_.find(peer_id);
+            if(it == this->last_append_success_at_.end()) { continue; }
+            if(now - it->second <= lease_duration) {
+                grants += 1;
+                if(grants >= quorum) { return true; }
+            }
+        }
+        return false;
     }
 
     raftpb::Entry Raft::to_proto_entry(const LogEntry &e) const {
@@ -298,15 +329,19 @@ namespace rafty {
         this->role_ = Role::Follower;
         this->current_term_ = std::max(this->current_term_, new_term);
         this->voted_for_.reset();
+        this->replication_requested_ = false;
+        this->last_append_success_at_.clear();
         this->reset_election_deadline_locked();
     }
 
     void Raft::become_leader_locked() {
         this->role_ = Role::Leader;
         this->next_heartbeat_at_ = std::chrono::steady_clock::now();
+        this->replication_requested_ = true;
 
         this->next_index_.clear();
         this->match_index_.clear();
+        this->last_append_success_at_.clear();
         const uint64_t next = this->last_log_index_locked() + 1;
         for(const auto &[peer_id, _] : this->peer_addrs) {
             this->next_index_[peer_id] = next;
@@ -321,6 +356,8 @@ namespace rafty {
         this->current_term_ += 1;
         this->voted_for_ = this->id;
         this->votes_granted_in_term_ = 1;
+        this->replication_requested_ = false;
+        this->last_append_success_at_.clear();
         this->reset_election_deadline_locked();
         logger->info("Node {} started election for term {}", this->id, this->current_term_);
 
@@ -467,6 +504,7 @@ namespace rafty {
                 if(this->votes_granted_in_term_ >= this->quorum_size()) {
                     this->become_leader_locked();
                     this->election_needs_vote_requests_ = false;
+                    break;
                 }
             }
         }
@@ -560,6 +598,8 @@ namespace rafty {
                 std::lock_guard<std::mutex> lk(this->mtx);
                 if(this->role_ != Role::Leader || this->current_term_ != plan.term) { continue; }
 
+                this->last_append_success_at_[peer_id] = std::chrono::steady_clock::now();
+
                 // Update follower progress - works for both empty and non-empty appends
                 const uint64_t advanced = plan.prev_log_index + static_cast<uint64_t>(plan.entries.size());
                 auto cur_match = this->match_index_.find(peer_id);
@@ -593,8 +633,9 @@ namespace rafty {
                 const auto now = std::chrono::steady_clock::now();
 
                 if(this->role_ == Role::Leader) {
-                    if(now >= this->next_heartbeat_at_) {
+                    if(this->replication_requested_ || now >= this->next_heartbeat_at_) {
                         should_send_heartbeat = true;
+                        this->replication_requested_ = false;
                         this->next_heartbeat_at_ = now + this->heartbeat_interval_;
                     }
                 } else if(now >= this->election_deadline_) {
@@ -613,7 +654,15 @@ namespace rafty {
             if(should_request_votes) { this->send_request_votes_once(vote_request_term); }
 
             std::unique_lock<std::mutex> lk(this->mtx);
-            this->ticker_cv_.wait_for(lk, kTickerSleepInterval, [this] { return this->dead.load(); });
+            if(this->dead.load()) { break; }
+
+            auto wake_at = this->role_ == Role::Leader ? this->next_heartbeat_at_ : this->election_deadline_;
+            if(wake_at <= std::chrono::steady_clock::now()) { continue; }
+
+            this->ticker_cv_.wait_until(lk, wake_at, [this] {
+                return this->dead.load() || this->replication_requested_
+                       || (this->election_needs_vote_requests_ && this->role_ == Role::Candidate);
+            });
         }
     }
 
